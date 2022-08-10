@@ -18,7 +18,7 @@ yarn publish
 - delete key: `yarn key delete KEY_REF`
 - list keys: `yarn key list`
 
-Where `KEY_REF` (reference or name of secrets) can be arbitrary text, such as an uuid. It should be kept as a secret, since otherwise it would allow anyone to raise a request.
+Where `KEY_REF` (reference or name of keys/secrets) can be arbitrary text, such as an uuid. It should be kept as a secret, since otherwise it would allow anyone to raise a request.
 
 **Retrieve key with approval**
 `curl https://keywa.example.org/key/KEY_REF/SESSION_NAME`
