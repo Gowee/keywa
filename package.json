@@ -3,6 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
+    "build": "npx wrangler build",
     "dev": "npx wrangler dev",
     "publish": "npx wrangler publish",
     "format": "prettier --write  '*.{json,js}' 'src/**/*.{js,ts}'",
