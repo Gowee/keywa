@@ -7,7 +7,7 @@ A simple web service for retrieving keys with approval.
 ```sh
 git clone https://github.com/Gowee/keywa && cd keywa
 yarn install
-cp wrangler.toml.sample wrangler.toml.sample
+cp wrangler.toml.sample wrangler.toml
 # fill the Telegram bot token and KV namespace ID as listed in wrangler.toml
 yarn publish
 ```
