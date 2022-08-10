@@ -9,7 +9,7 @@ git clone https://github.com/Gowee/keywa && cd keywa
 yarn install
 cp wrangler.toml.sample wrangler.toml
 # fill the Telegram bot token and KV namespace ID as listed in wrangler.toml
-yarn publish
+yarn deploy
 ```
 
 ## Workflow

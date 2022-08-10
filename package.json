@@ -5,7 +5,7 @@
   "scripts": {
     "build": "npx wrangler publish --dry-run --outdir=dist",
     "dev": "npx wrangler dev",
-    "publish": "npx wrangler publish",
+    "deploy": "npx wrangler publish",
     "format": "prettier --write  '*.{json,js}' 'src/**/*.{js,ts}'",
     "lint": "eslint --max-warnings=0 src && prettier --check '*.{json,js}' 'src/**/*.{js,ts}'",
     "key": "npx wrangler kv:key --binding KEYWA"
