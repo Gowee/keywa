@@ -64,9 +64,10 @@ export default {
           }
 
           if (
-            !state.notified_at ||
-            Date.now() - +new Date(state.notified_at) >
-              TIMEOUT_IN_SECONDS * 1000
+            !state.approved &&
+            (!state.notified_at ||
+              Date.now() - +new Date(state.notified_at) >
+                TIMEOUT_IN_SECONDS * 1000)
           ) {
             const aurl = new URL(
               `/approve/${ref}/${session}/${state.token}`,
