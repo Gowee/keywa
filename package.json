@@ -3,7 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "build": "npx wrangler build",
+    "build": "npx wrangler publish --dry-run --outdir=dist",
     "dev": "npx wrangler dev",
     "publish": "npx wrangler publish",
     "format": "prettier --write  '*.{json,js}' 'src/**/*.{js,ts}'",
