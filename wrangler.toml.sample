@@ -2,13 +2,10 @@ name = "keywa"
 main = "src/index.ts"
 compatibility_date = "2022-08-09"
 
-[vars]
-TIK = "tikk"
-
 [[kv_namespaces]]
 binding = "KEYWA"
 id = "TO_BE_FILLED"
-# To create: wrangler kv:namespace create KEYWA
+# To create: npx wrangler kv:namespace create KEYWA
 
 # The necessary secrets are:
 # - TELEGRAM_CHAT_ID
