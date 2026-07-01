@@ -1,14 +1,24 @@
 name = "keywa"
 main = "src/index.ts"
-compatibility_date = "2022-08-09"
+compatibility_date = "2024-04-03"
 
 [[kv_namespaces]]
-binding = "KEYWA"
+binding = "SECRETS"
 id = "TO_BE_FILLED"
-# To create: npx wrangler kv:namespace create KEYWA
+# To create: pnpm wrangler kv namespace create SECRETS
 
-# The necessary secrets are:
-# - TELEGRAM_CHAT_ID
+[[durable_objects.bindings]]
+name = "KEY_SESSION_DO"
+class_name = "KeySessionDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["KeySessionDO"]
+
+# Required secrets (set via `echo VALUE | pnpm wrangler secret put NAME`):
 # - TELEGRAM_BOT_TOKEN
-# Run `echo <VALUE> | wrangler secret put <NAME>` for each of these
-
+# - TELEGRAM_CHAT_ID
+# - ADMIN_TOKEN             (arbitrary secret string for admin endpoints)
+#
+# Optional secrets:
+# - TELEGRAM_WEBHOOK_SECRET   (if set, verifies X-Telegram-Bot-Api-Secret-Token header)
