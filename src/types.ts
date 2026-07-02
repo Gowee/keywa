@@ -5,6 +5,7 @@ export interface Env {
   TELEGRAM_CHAT_ID: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   ADMIN_TOKEN: string;
+  TIMEOUT_SECONDS?: string;
 }
 
 /** A secret stored in KV */
@@ -13,17 +14,23 @@ export interface StoredSecret {
   token: string;
 }
 
-/** The state of an approval request, persisted in DO SQLite */
+/** The state of an approval request, persisted in DO KV. */
 export interface Approval {
   secretId: string;
   session: string;
-  secretValue: string;
   status: "pending" | "approved" | "denied" | "expired";
-  approvalNonce: string;
+  callbackNonce: string;
   ip: string;
   createdAt: number;
   notifiedAt: number | null;
+  expiresAt: number;
+  chatId: string | number | null;
+  messageId: number | null;
 }
 
-export const TIMEOUT_MS = 15 * 60 * 1000; // 15 minutes
+/** Get the timeout in milliseconds from env, defaulting to 900s (15 min). */
+export function getTimeoutMs(env: { TIMEOUT_SECONDS?: string }): number {
+  return (parseInt(env.TIMEOUT_SECONDS || "", 10) || 900) * 1000;
+}
+
 export const DEFAULT_SESSION = "default";

@@ -6,12 +6,24 @@ import {
   answerCallbackQuery,
   updateApprovalMessage,
   registerWebhook,
+  formatTelegramUser,
 } from "./telegram";
 import { createSession, verifySession, destroySession } from "./telegram-auth";
 import { loginPage, dashboardPage } from "./admin-ui";
 import { KeySessionDO } from "./key-session-do";
+import { doName } from "./crypto";
 
 const app = new Hono<{ Bindings: Env }>();
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/** Reject secretId or session containing null byte (delimiter for DO name hashing). */
+function rejectNullByte(value: string, label: string): string | null {
+  if (value.includes("\0")) return `${label} must not contain null byte`;
+  return null;
+}
 
 // ---------------------------------------------------------------------------
 // Secret retrieval — long-poll until approved
@@ -33,9 +45,14 @@ async function handleSecretRequest(
     "unknown";
 
   if (!secretId) return c.text("secretId required", 400);
+  if (secretId.length > LIMITS.secretId) return c.text(`secretId too long (max ${LIMITS.secretId})`, 400);
+  if (session.length > LIMITS.session) return c.text(`session too long (max ${LIMITS.session})`, 400);
+  const nullErr = rejectNullByte(secretId, "secretId") || rejectNullByte(session, "session");
+  if (nullErr) return c.text(nullErr, 400);
   if (!secretToken)
     return c.text("token required (query param or Bearer header)", 401);
 
+  // Validate secret exists and token matches (before blocking on DO)
   const raw = await c.env.SECRETS.get(secretId);
   if (!raw) return c.text("Secret not found", 404);
 
@@ -48,17 +65,28 @@ async function handleSecretRequest(
 
   if (stored.token !== secretToken) return c.text("Invalid token", 403);
 
-  const doId = c.env.KEY_SESSION_DO.idFromName(`${secretId}/${session}`);
+  // DO does NOT store the secret — we re-fetch from KV after approval
+  const name = await doName(secretId, session);
+  const doId = c.env.KEY_SESSION_DO.idFromName(name);
   const stub = c.env.KEY_SESSION_DO.get(
     doId,
   ) as DurableObjectStub<KeySessionDO>;
 
-  await stub.init(secretId, session, stored.secret, ip);
-  const approval = await stub.wait(secretId, session);
+  await stub.init(secretId, session, ip);
+  const approval = await stub.wait();
 
   switch (approval.status) {
-    case "approved":
-      return c.text(approval.secretValue);
+    case "approved": {
+      // Re-fetch secret from KV (DO doesn't store it)
+      const freshRaw = await c.env.SECRETS.get(secretId);
+      if (!freshRaw) return c.text("Secret deleted", 410);
+      try {
+        const fresh = JSON.parse(freshRaw) as StoredSecret;
+        return c.text(fresh.secret);
+      } catch {
+        return c.text("Secret format invalid", 500);
+      }
+    }
     case "denied":
       return c.text("Denied", 403);
     case "expired":
@@ -109,34 +137,29 @@ app.post("/telegram/webhook", async (c) => {
     return c.json({ ok: true });
   }
 
-  const { action, approvalNonce } = parsed;
+  const { action, doName: name, callbackNonce } = parsed;
 
-  const mapping = await c.env.SECRETS.get(`cb:${approvalNonce}`);
-  if (!mapping) {
-    await answerCallbackQuery(
-      c.env.TELEGRAM_BOT_TOKEN,
-      cb.id,
-      "❌ Request expired or not found",
-    );
-    return c.json({ ok: true });
-  }
-
-  const { secretId, session, ip } = JSON.parse(mapping) as {
-    secretId: string;
-    session: string;
-    ip: string;
-  };
-
-  const doId = c.env.KEY_SESSION_DO.idFromName(`${secretId}/${session}`);
+  // Route to DO by hash name — no KV lookup needed
+  const doId = c.env.KEY_SESSION_DO.idFromName(name);
   const stub = c.env.KEY_SESSION_DO.get(
     doId,
   ) as DurableObjectStub<KeySessionDO>;
 
-  let result: { ok: boolean; error?: string };
+  // DO validates nonce and returns approval info for display
+  let result: {
+    ok: boolean;
+    error?: string;
+    approval?: {
+      secretId: string;
+      session: string;
+      ip: string;
+      expiresAt: number;
+    };
+  };
   if (action === "approve") {
-    result = await stub.approve(secretId, session, approvalNonce);
+    result = await stub.approve(callbackNonce);
   } else {
-    result = await stub.deny(secretId, session, approvalNonce);
+    result = await stub.deny(callbackNonce);
   }
 
   const toastText = result.ok
@@ -148,22 +171,21 @@ app.post("/telegram/webhook", async (c) => {
   await answerCallbackQuery(c.env.TELEGRAM_BOT_TOKEN, cb.id, toastText);
 
   // Update the Telegram message to show the result (remove buttons)
-  if (result.ok && cb.message) {
+  if (result.ok && cb.message && result.approval) {
     const status = action === "approve" ? "approved" : "denied";
     const user = formatTelegramUser(cb.from);
     await updateApprovalMessage(
       c.env.TELEGRAM_BOT_TOKEN,
       cb.message.chat.id,
       cb.message.message_id,
-      secretId,
-      session,
-      ip,
+      result.approval.secretId,
+      result.approval.session,
+      result.approval.ip,
       status,
+      result.approval.expiresAt,
       user,
     );
   }
-
-  await c.env.SECRETS.delete(`cb:${approvalNonce}`);
 
   return c.json({ ok: true });
 });
@@ -190,11 +212,7 @@ app.post("/admin/auth/login-token", async (c) => {
       typeof c.env.TELEGRAM_CHAT_ID === "string"
         ? parseInt(c.env.TELEGRAM_CHAT_ID, 10)
         : c.env.TELEGRAM_CHAT_ID || 0;
-    const cookie = await createSession(
-      userId,
-      c.env.ADMIN_TOKEN,
-      c.env.SECRETS,
-    );
+    const cookie = await createSession(userId, c.env.ADMIN_TOKEN);
     return new Response(JSON.stringify({ status: "approved" }), {
       status: 200,
       headers: {
@@ -209,21 +227,13 @@ app.post("/admin/auth/login-token", async (c) => {
 });
 
 app.get("/admin", async (c) => {
-  const userId = await verifySession(
-    c.req.raw,
-    c.env.ADMIN_TOKEN,
-    c.env.SECRETS,
-  );
+  const userId = await verifySession(c.req.raw, c.env.ADMIN_TOKEN);
   if (userId) return c.redirect("/admin/dashboard");
   return c.html(loginPage());
 });
 
 app.get("/admin/dashboard", async (c) => {
-  const userId = await verifySession(
-    c.req.raw,
-    c.env.ADMIN_TOKEN,
-    c.env.SECRETS,
-  );
+  const userId = await verifySession(c.req.raw, c.env.ADMIN_TOKEN);
   if (!userId) return c.redirect("/admin");
   return c.html(dashboardPage());
 });
@@ -239,26 +249,25 @@ app.post("/admin/auth/login", async (c) => {
     const body = await c.req.json<{ session?: string }>().catch(() => ({}));
     const nonce = crypto.randomUUID().slice(0, 8);
     const secretId = `__auth__`;
-    const session = body.session || `login-${nonce}`;
+    let session = body.session || `login-${nonce}`;
+    if (session.length > LIMITS.session) session = session.slice(0, LIMITS.session);
+    if (session.includes("\0")) return c.text("session must not contain null byte", 400);
 
-    const doId = c.env.KEY_SESSION_DO.idFromName(`${secretId}/${session}`);
+    const name = await doName(secretId, session);
+    const doId = c.env.KEY_SESSION_DO.idFromName(name);
     const stub = c.env.KEY_SESSION_DO.get(
       doId,
     ) as DurableObjectStub<KeySessionDO>;
 
-    await stub.init(secretId, session, "", ip);
-    const approval = await stub.wait(secretId, session);
+    await stub.init(secretId, session, ip);
+    const approval = await stub.wait();
 
     if (approval.status === "approved") {
       const userId =
         typeof c.env.TELEGRAM_CHAT_ID === "string"
           ? parseInt(c.env.TELEGRAM_CHAT_ID, 10)
           : c.env.TELEGRAM_CHAT_ID;
-      const cookie = await createSession(
-        userId,
-        c.env.ADMIN_TOKEN,
-        c.env.SECRETS,
-      );
+      const cookie = await createSession(userId, c.env.ADMIN_TOKEN);
       return new Response(JSON.stringify({ status: "approved" }), {
         status: 200,
         headers: {
@@ -276,12 +285,8 @@ app.post("/admin/auth/login", async (c) => {
   }
 });
 
-app.post("/admin/auth/logout", async (c) => {
-  const cookie = await destroySession(
-    c.req.raw,
-    c.env.ADMIN_TOKEN,
-    c.env.SECRETS,
-  );
+app.post("/admin/auth/logout", async (_c) => {
+  const cookie = destroySession();
   return new Response(JSON.stringify({ ok: true }), {
     status: 200,
     headers: {
@@ -301,7 +306,6 @@ app.get("/admin/api/secrets", async (c) => {
   const list = await c.env.SECRETS.list();
   const secrets = [];
   for (const key of list.keys) {
-    if (key.name.startsWith("session:") || key.name.startsWith("cb:")) continue;
     const raw = await c.env.SECRETS.get(key.name);
     if (!raw) continue;
     try {
@@ -315,7 +319,7 @@ app.get("/admin/api/secrets", async (c) => {
   return c.json(secrets);
 });
 
-const LIMITS = { secretId: 128, token: 128, value: 65536 };
+const LIMITS = { secretId: 128, session: 128, token: 128, value: 65536 };
 
 app.put("/admin/api/secrets/:secretId", async (c) => {
   if (!(await isAdmin(c))) return c.text("Unauthorized", 401);
@@ -412,39 +416,13 @@ async function isAdmin(c: {
   if (auth?.startsWith("Bearer ") && auth.slice(7) === c.env.ADMIN_TOKEN) {
     return true;
   }
-  const userId = await verifySession(
-    c.req.raw,
-    c.env.ADMIN_TOKEN,
-    c.env.SECRETS,
-  );
+  const userId = await verifySession(c.req.raw, c.env.ADMIN_TOKEN);
   return userId !== null;
 }
 
 function extractBearerToken(header: string | undefined): string | undefined {
   if (!header?.startsWith("Bearer ")) return undefined;
   return header.slice(7) || undefined;
-}
-
-/** Format Telegram user as a MarkdownV2 link: "FirstName LastName" → tg://user?id=... */
-function formatTelegramUser(from?: {
-  id: number;
-  username?: string;
-  first_name?: string;
-  last_name?: string;
-}): string | undefined {
-  if (!from) return undefined;
-
-  const escape = (s: string) =>
-    s.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\$1");
-
-  // Prefer "FirstName LastName", fallback to @username, then numeric ID
-  const label = from.first_name
-    ? escape([from.first_name, from.last_name].filter(Boolean).join(" "))
-    : from.username
-      ? `@${escape(from.username)}`
-      : String(from.id);
-
-  return `[${label}](tg://user?id=${from.id})`;
 }
 
 // ---------------------------------------------------------------------------

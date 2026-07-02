@@ -1,11 +1,16 @@
 /**
  * Session management for the web admin.
  *
- * Sessions are signed JWTs stored in KV. The JWT contains the Telegram user ID
- * and expiry time. Signed with HMAC-SHA256 using ADMIN_TOKEN as the secret.
+ * Sessions are signed JWTs stored in cookies only — no server-side state.
+ * The JWT contains the Telegram user ID and expiry time, signed with
+ * HMAC-SHA256 using ADMIN_TOKEN as the secret.
  *
  * No external JWT library needed — just base64url + HMAC via Web Crypto API.
+ *
+ * Revocation: change ADMIN_TOKEN. All sessions become invalid immediately.
  */
+
+import { base64url, unbase64url } from "./crypto";
 
 const SESSION_TTL_SECONDS = 24 * 60 * 60; // 24 hours
 const COOKIE_NAME = "keywa_session";
@@ -17,27 +22,6 @@ interface SessionPayload {
 }
 
 // --- JWT helpers (minimal, no dependency) ---
-
-function base64url(data: ArrayBuffer | Uint8Array | string): string {
-  const bytes =
-    typeof data === "string"
-      ? new TextEncoder().encode(data)
-      : new Uint8Array(data);
-  let binary = "";
-  for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary)
-    .replace(/\+/g, "-")
-    .replace(/\//g, "_")
-    .replace(/=+$/, "");
-}
-
-function unbase64url(s: string): Uint8Array {
-  const padded =
-    s.replace(/-/g, "+").replace(/_/g, "/") +
-    "=".repeat((4 - (s.length % 4)) % 4);
-  const binary = atob(padded);
-  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
-}
 
 async function hmacKey(secret: string): Promise<CryptoKey> {
   return crypto.subtle.importKey(
@@ -53,8 +37,8 @@ async function signJwt(
   payload: SessionPayload,
   secret: string,
 ): Promise<string> {
-  const header = base64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
-  const body = base64url(JSON.stringify(payload));
+  const header = base64url(new TextEncoder().encode(JSON.stringify({ alg: "HS256", typ: "JWT" })));
+  const body = base64url(new TextEncoder().encode(JSON.stringify(payload)));
   const data = `${header}.${body}`;
   const key = await hmacKey(secret);
   const sig = await crypto.subtle.sign(
@@ -62,7 +46,7 @@ async function signJwt(
     key,
     new TextEncoder().encode(data),
   );
-  return `${data}.${base64url(sig)}`;
+  return `${data}.${base64url(new Uint8Array(sig))}`;
 }
 
 async function verifyJwt(
@@ -96,7 +80,6 @@ async function verifyJwt(
 export async function createSession(
   userId: number,
   secret: string,
-  kv: KVNamespace,
 ): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
   const payload: SessionPayload = {
@@ -106,13 +89,6 @@ export async function createSession(
   };
   const jwt = await signJwt(payload, secret);
 
-  // Store in KV for revocation support (key: session:{jwt_prefix}, value: "1")
-  // We store a short prefix so we can revoke by deleting the KV entry
-  const prefix = jwt.slice(0, 32);
-  await kv.put(`session:${prefix}`, "1", {
-    expirationTtl: SESSION_TTL_SECONDS,
-  });
-
   return `${COOKIE_NAME}=${jwt}; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_TTL_SECONDS}`;
 }
 
@@ -120,7 +96,6 @@ export async function createSession(
 export async function verifySession(
   request: Request,
   secret: string,
-  kv: KVNamespace,
 ): Promise<number | null> {
   const jwt = extractCookie(request, COOKIE_NAME);
   if (!jwt) return null;
@@ -128,25 +103,11 @@ export async function verifySession(
   const payload = await verifyJwt(jwt, secret);
   if (!payload) return null;
 
-  // Check if session was revoked
-  const prefix = jwt.slice(0, 32);
-  const exists = await kv.get(`session:${prefix}`);
-  if (!exists) return null;
-
   return payload.uid;
 }
 
 /** Destroy the session (logout). Returns the Set-Cookie header to clear it. */
-export async function destroySession(
-  request: Request,
-  secret: string,
-  kv: KVNamespace,
-): Promise<string> {
-  const jwt = extractCookie(request, COOKIE_NAME);
-  if (jwt) {
-    const prefix = jwt.slice(0, 32);
-    await kv.delete(`session:${prefix}`);
-  }
+export function destroySession(): string {
   return `${COOKIE_NAME}=; Path=/admin; HttpOnly; Secure; SameSite=Strict; Max-Age=0`;
 }
 

@@ -4,42 +4,51 @@
  * Uses inline callback buttons (not URL buttons) so approval happens
  * entirely within Telegram — no browser needed.
  *
- * callback_data format: "a:{approvalNonce}" or "d:{approvalNonce}"
- * where approvalNonce is a UUID (36 chars). Total: 39 bytes, fits in 64-byte limit.
- * The DO is already identified by the webhook routing (secretId + session encoded
- * in the message metadata via KV lookup), so callback_data only needs the action
- * and the approvalNonce for validation.
+ * callback_data format: "a:{doName22}:{callbackNonce22}" or "d:{doName22}:{callbackNonce22}"
+ * where doName = base64url(SHA-256(secretId+"\0"+session).slice(0,16)) and
+ * callbackNonce = base64url(random 16 bytes). Total: 48 bytes, fits in 64-byte Telegram limit.
+ *
+ * The DO name is derived from the hash, so the webhook can route directly
+ * to the DO without any KV lookup.
  */
+
+import { doName } from "./crypto";
 
 const TELEGRAM_API = "https://api.telegram.org/bot";
 
 /** Build callback_data string. */
 export function buildCallbackData(
   action: "a" | "d",
-  approvalNonce: string,
+  doNameHash: string,
+  callbackNonce: string,
 ): string {
-  return `${action}:${approvalNonce}`;
+  return `${action}:${doNameHash}:${callbackNonce}`;
 }
 
 /** Parse callback_data back into its components. */
 export function parseCallbackData(data: string): {
   action: "approve" | "deny";
-  approvalNonce: string;
+  doName: string;
+  callbackNonce: string;
 } | null {
-  const colonIdx = data.indexOf(":");
-  if (colonIdx === -1) return null;
-  const action = data.slice(0, colonIdx);
+  const parts = data.split(":");
+  if (parts.length !== 3) return null;
+  const [action, name, nonce] = parts;
   if (action !== "a" && action !== "d") return null;
+  if (!name || !nonce) return null;
   return {
     action: action === "a" ? "approve" : "deny",
-    approvalNonce: data.slice(colonIdx + 1),
+    doName: name,
+    callbackNonce: nonce,
   };
 }
 
 /**
  * Send an approval request message with inline Approve/Deny buttons.
- * Also stores a mapping from approvalNonce → (secretId, session) in KV
- * so the webhook handler can find the right DO.
+ * The DO name hash is embedded in callback_data so the webhook can route
+ * directly to the DO without any KV lookup.
+ *
+ * Returns the Telegram message_id for later updates.
  */
 export async function sendApprovalMessage(
   botToken: string,
@@ -47,23 +56,14 @@ export async function sendApprovalMessage(
   secretId: string,
   session: string,
   ip: string,
-  approvalNonce: string,
-  kv: KVNamespace,
-): Promise<void> {
-  const approveData = buildCallbackData("a", approvalNonce);
-  const denyData = buildCallbackData("d", approvalNonce);
+  callbackNonce: string,
+  expiresAt: number,
+): Promise<{ messageId: number }> {
+  const name = await doName(secretId, session);
+  const approveData = buildCallbackData("a", name, callbackNonce);
+  const denyData = buildCallbackData("d", name, callbackNonce);
 
-  // Store mapping: approvalNonce → (secretId, session) for webhook routing
-  // Expire after 15 minutes (matching request timeout)
-  await kv.put(
-    `cb:${approvalNonce}`,
-    JSON.stringify({ secretId, session, ip }),
-    {
-      expirationTtl: 900,
-    },
-  );
-
-  const text = formatRequestMessage(secretId, session, ip);
+  const text = formatRequestMessage(secretId, session, ip, expiresAt);
 
   const resp = await fetch(`${TELEGRAM_API}${botToken}/sendMessage`, {
     method: "POST",
@@ -71,7 +71,7 @@ export async function sendApprovalMessage(
     body: JSON.stringify({
       chat_id: chatId,
       text,
-      parse_mode: "MarkdownV2",
+      parse_mode: "HTML",
       reply_markup: {
         inline_keyboard: [
           [
@@ -87,6 +87,9 @@ export async function sendApprovalMessage(
     const body = await resp.text();
     throw new Error(`Telegram sendMessage failed: ${resp.status} ${body}`);
   }
+
+  const result = (await resp.json()) as { ok: boolean; result: { message_id: number } };
+  return { messageId: result.result.message_id };
 }
 
 /**
@@ -101,27 +104,32 @@ export async function updateApprovalMessage(
   session: string,
   ip: string,
   status: "approved" | "denied" | "expired",
+  expiresAt?: number,
   user?: string,
 ): Promise<void> {
   const statusEmoji =
     status === "approved" ? "✅" : status === "denied" ? "❌" : "⏰";
   const statusLabel = status.charAt(0).toUpperCase() + status.slice(1);
-  // user is already MarkdownV2-formatted (with link), don't escape it
   const userLine = user ? ` by ${user}` : "";
   const text =
-    formatRequestMessage(secretId, session, ip) +
-    `\n\n${statusEmoji} *${escapeMarkdown(statusLabel)}*${userLine}`;
+    formatRequestMessage(secretId, session, ip, expiresAt) +
+    `\n\n${statusEmoji} <b>${escapeHtml(statusLabel)}</b>${userLine}`;
 
-  await fetch(`${TELEGRAM_API}${botToken}/editMessageText`, {
+  const resp = await fetch(`${TELEGRAM_API}${botToken}/editMessageText`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       chat_id: chatId,
       message_id: messageId,
       text,
-      parse_mode: "MarkdownV2",
+      parse_mode: "HTML",
     }),
   });
+
+  if (!resp.ok) {
+    const body = await resp.text();
+    console.error(`Telegram editMessageText failed: ${resp.status} ${body}`);
+  }
 }
 
 /** Answer a callback query to dismiss the loading spinner and show a toast. */
@@ -167,16 +175,49 @@ function formatRequestMessage(
   secretId: string,
   session: string,
   ip: string,
+  expiresAt?: number,
 ): string {
-  return [
-    "🔐 *Approval Required*",
+  const lines = [
+    "🔑 <b>Key Request</b>",
     "",
-    `Secret:  \`${escapeMarkdown(secretId)}\``,
-    `Session: \`${escapeMarkdown(session)}\``,
-    `IP:      \`${escapeMarkdown(ip)}\``,
-  ].join("\n");
+    `Secret:  <code>${escapeHtml(secretId)}</code>`,
+    `Session: <code>${escapeHtml(session)}</code>`,
+    `IP:      <code>${escapeHtml(ip)}</code>`,
+  ];
+  if (expiresAt) {
+    lines.push(`Expires: <code>${escapeHtml(formatUTC(expiresAt))}</code>`);
+  }
+  return lines.join("\n");
 }
 
-function escapeMarkdown(text: string): string {
-  return text.replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
+function formatUTC(ms: number): string {
+  const d = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
+}
+
+/** Escape HTML special characters for Telegram HTML parse mode. */
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+/**
+ * Format a Telegram user as an HTML link.
+ * Only ASCII-safe names get linked; non-ASCII names are shown as plain text.
+ */
+export function formatTelegramUser(from?: {
+  id: number;
+  username?: string;
+  first_name?: string;
+  last_name?: string;
+}): string | undefined {
+  if (!from) return undefined;
+
+  const name = [from.first_name, from.last_name].filter(Boolean).join(" ");
+  const label = name || from.username || String(from.id);
+
+  return `<a href="tg://user?id=${from.id}">${escapeHtml(label)}</a>`;
 }

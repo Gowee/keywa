@@ -1,137 +1,148 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Approval } from "./types";
-import { sendApprovalMessage } from "./telegram";
-import { TIMEOUT_MS } from "./types";
+import { getTimeoutMs } from "./types";
+import { sendApprovalMessage, updateApprovalMessage } from "./telegram";
+import { randomNonce } from "./crypto";
 
 /**
  * Durable Object managing a single secret request session.
  *
- * Uses RPC methods (not fetch handler) and SQLite storage per CF best practices.
+ * Uses RPC methods (not fetch handler) and KV storage.
  * The `wait()` method returns a Promise that resolves when `approve()` or `deny()`
  * is called, or when the alarm fires (timeout).
+ *
+ * Storage: a single KV key "state" containing the request state as JSON.
+ * No secretValue is stored — the worker re-fetches from KV (SECRETS) after approval.
+ *
+ * Lifecycle:
+ *   init()    → store state, set alarm, notify Telegram
+ *   wait()    → hold Promise in memory
+ *   approve() → validate nonce, resolve wait(), delete state
+ *   deny()    → validate nonce, resolve wait(), delete state
+ *   alarm()   → update Telegram message (expired), resolve wait(), delete state
  */
-export class KeySessionDO extends DurableObject<Env> {
-  /** Resolver for the pending wait() call, held in memory. */
-  private waitResolver: ((value: Approval) => void) | null = null;
 
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    ctx.blockConcurrencyWhile(async () => {
-      ctx.storage.sql.exec(`
-        CREATE TABLE IF NOT EXISTS approval (
-          secret_id      TEXT NOT NULL,
-          session        TEXT NOT NULL,
-          secret_value   TEXT NOT NULL,
-          status         TEXT NOT NULL DEFAULT 'pending',
-          approval_nonce TEXT NOT NULL,
-          ip             TEXT NOT NULL,
-          created_at     INTEGER NOT NULL,
-          notified_at    INTEGER,
-          PRIMARY KEY (secret_id, session)
-        )
-      `);
-    });
-  }
+interface State {
+  secretId: string;
+  session: string;
+  status: "pending" | "approved" | "denied";
+  callbackNonce: string;
+  ip: string;
+  createdAt: number;
+  notifiedAt: number | null;
+  expiresAt: number;
+  chatId: string | number | null;
+  messageId: number | null;
+}
+
+const STATE_KEY = "state";
+
+export class KeySessionDO extends DurableObject<Env> {
+  private waitResolver: ((value: Approval) => void) | null = null;
 
   /**
    * Initialize or recover a session.
    * Sends a Telegram notification if this is a fresh request or the previous
-   * notification has expired.
+   * notification has expired. Re-requesting a pending session refreshes the timeout.
    */
   async init(
     secretId: string,
     session: string,
-    secretValue: string,
     ip: string,
   ): Promise<Approval> {
-    // Check for existing session
-    const existing = this.loadApproval(secretId, session);
-    if (existing) {
-      // If already resolved, return immediately
-      if (existing.status !== "pending") return existing;
+    const existing = this.loadState();
+    const timeoutMs = getTimeoutMs(this.env);
 
-      // If pending and recently notified, just return (caller will wait())
-      if (
-        existing.notifiedAt &&
-        Date.now() - existing.notifiedAt < TIMEOUT_MS
-      ) {
-        return existing;
+    if (existing) {
+      // Already resolved — return immediately
+      if (existing.status !== "pending") {
+        return this.toApproval(existing);
       }
 
-      // Pending but notification expired — re-notify
-      await this.notify(existing);
-      this.updateNotifiedAt(secretId, session, Date.now());
-      return { ...existing, notifiedAt: Date.now() };
+      // Pending and recently notified — refresh alarm, return
+      if (
+        existing.notifiedAt &&
+        Date.now() - existing.notifiedAt < timeoutMs
+      ) {
+        const expiresAt = Date.now() + timeoutMs;
+        this.saveState({ ...existing, expiresAt });
+        await this.ctx.storage.setAlarm(expiresAt);
+        return this.toApproval({ ...existing, expiresAt });
+      }
+
+      // Pending but notification expired — re-notify and refresh alarm
+      const expiresAt = Date.now() + timeoutMs;
+      const refreshed = { ...existing, expiresAt, notifiedAt: Date.now() };
+      this.saveState(refreshed);
+      await this.ctx.storage.setAlarm(expiresAt);
+      await this.notify(refreshed);
+      return this.toApproval(this.loadState()!);
     }
 
-    // New session
-    const approvalNonce = crypto.randomUUID();
+    // New request
+    const callbackNonce = randomNonce();
     const now = Date.now();
-    const approval: Approval = {
+    const expiresAt = now + timeoutMs;
+    const state: State = {
       secretId,
       session,
-      secretValue,
       status: "pending",
-      approvalNonce,
+      callbackNonce,
       ip,
       createdAt: now,
       notifiedAt: null,
+      expiresAt,
+      chatId: null,
+      messageId: null,
     };
 
-    this.saveApproval(approval);
-    await this.notify(approval);
-    this.updateNotifiedAt(secretId, session, now);
+    this.saveState(state);
+    await this.ctx.storage.setAlarm(expiresAt);
+    await this.notify(state);
 
-    // Set alarm for automatic expiry/cleanup
-    await this.ctx.storage.setAlarm(now + TIMEOUT_MS);
-
-    return { ...approval, notifiedAt: now };
+    return this.toApproval(this.loadState()!);
   }
 
   /**
-   * Approve a pending request. Validates the approval nonce.
-   * Resolves the waiting wait() Promise if one is held.
+   * Approve a pending request. Validates the callback nonce.
+   * Resolves the waiting wait() Promise and cleans up KV state.
    */
   async approve(
-    secretId: string,
-    session: string,
-    approvalNonce: string,
-  ): Promise<{ ok: boolean; error?: string }> {
-    const approval = this.loadApproval(secretId, session);
-    if (!approval) return { ok: false, error: "Session not found" };
-    if (approval.status !== "pending")
-      return { ok: false, error: `Already ${approval.status}` };
-    if (approval.approvalNonce !== approvalNonce)
+    callbackNonce: string,
+  ): Promise<{ ok: boolean; error?: string; approval?: Approval }> {
+    const state = this.loadState();
+    if (!state) return { ok: false, error: "Session not found" };
+    if (state.status !== "pending")
+      return { ok: false, error: `Already ${state.status}` };
+    if (state.callbackNonce !== callbackNonce)
       return { ok: false, error: "Invalid nonce" };
 
-    approval.status = "approved";
-    this.updateStatus(secretId, session, "approved");
-    this.resolveWait(approval);
+    state.status = "approved";
+    this.saveState(state);
+    const approval = this.resolveWait();
 
-    return { ok: true };
+    return { ok: true, approval };
   }
 
   /**
-   * Deny a pending request. Validates the approval nonce.
-   * Resolves the waiting wait() Promise if one is held.
+   * Deny a pending request. Validates the callback nonce.
+   * Resolves the waiting wait() Promise and cleans up KV state.
    */
   async deny(
-    secretId: string,
-    session: string,
-    approvalNonce: string,
-  ): Promise<{ ok: boolean; error?: string }> {
-    const approval = this.loadApproval(secretId, session);
-    if (!approval) return { ok: false, error: "Session not found" };
-    if (approval.status !== "pending")
-      return { ok: false, error: `Already ${approval.status}` };
-    if (approval.approvalNonce !== approvalNonce)
+    callbackNonce: string,
+  ): Promise<{ ok: boolean; error?: string; approval?: Approval }> {
+    const state = this.loadState();
+    if (!state) return { ok: false, error: "Session not found" };
+    if (state.status !== "pending")
+      return { ok: false, error: `Already ${state.status}` };
+    if (state.callbackNonce !== callbackNonce)
       return { ok: false, error: "Invalid nonce" };
 
-    approval.status = "denied";
-    this.updateStatus(secretId, session, "denied");
-    this.resolveWait(approval);
+    state.status = "denied";
+    this.saveState(state);
+    const approval = this.resolveWait();
 
-    return { ok: true };
+    return { ok: true, approval };
   }
 
   /**
@@ -139,16 +150,11 @@ export class KeySessionDO extends DurableObject<Env> {
    * approved, denied, or expired. The DO processes other RPC calls
    * (approve/deny) while this Promise is pending.
    */
-  async wait(secretId: string, session: string): Promise<Approval> {
-    const approval = this.loadApproval(secretId, session);
-    if (!approval) {
-      throw new Error("Session not found");
-    }
-    if (approval.status !== "pending") {
-      return approval;
-    }
+  async wait(): Promise<Approval> {
+    const state = this.loadState();
+    if (!state) throw new Error("Session not found");
+    if (state.status !== "pending") return this.toApproval(state);
 
-    // Hold the resolver in memory; approve()/deny()/alarm() will call it
     return new Promise<Approval>((resolve) => {
       this.waitResolver = resolve;
     });
@@ -156,105 +162,108 @@ export class KeySessionDO extends DurableObject<Env> {
 
   /**
    * Alarm handler — fires on timeout.
-   * Marks the request as expired and resolves any waiting wait() call.
+   * Updates Telegram message to show expiration, resolves wait(), cleans up.
    */
   async alarm(): Promise<void> {
-    const cursor = this.ctx.storage.sql.exec(
-      `SELECT secret_id, session FROM approval WHERE status = 'pending'`,
-    );
-    const rows = cursor.toArray();
-    for (const row of rows) {
-      const secretId = row.secret_id as string;
-      const session = row.session as string;
-      this.updateStatus(secretId, session, "expired");
+    const state = this.loadState();
+    if (!state) return;
 
-      const approval = this.loadApproval(secretId, session);
-      if (approval) {
-        this.resolveWait(approval);
+    // Best-effort: update Telegram message to show expired
+    if (state.chatId != null && state.messageId != null) {
+      try {
+        await updateApprovalMessage(
+          this.env.TELEGRAM_BOT_TOKEN,
+          state.chatId,
+          state.messageId,
+          state.secretId,
+          state.session,
+          state.ip,
+          "expired",
+          state.expiresAt,
+        );
+      } catch {
+        // Best-effort — ignore errors
       }
+    }
+
+    // Resolve wait() with expired status, then clean up
+    const approval: Approval = {
+      ...state,
+      status: "expired",
+      expiresAt: state.expiresAt,
+    };
+    this.ctx.storage.kv.delete(STATE_KEY);
+
+    if (this.waitResolver) {
+      this.waitResolver(approval);
+      this.waitResolver = null;
     }
   }
 
   // --- Private helpers ---
 
-  private loadApproval(secretId: string, session: string): Approval | null {
-    const cursor = this.ctx.storage.sql.exec(
-      `SELECT * FROM approval WHERE secret_id = ? AND session = ?`,
-      secretId,
-      session,
-    );
-    const row = cursor.toArray()[0];
-    if (!row) return null;
+  private loadState(): State | null {
+    const raw = this.ctx.storage.kv.get<string>(STATE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as State;
+  }
+
+  private saveState(state: State): void {
+    this.ctx.storage.kv.put(STATE_KEY, JSON.stringify(state));
+  }
+
+  private toApproval(state: State): Approval {
     return {
-      secretId: row.secret_id as string,
-      session: row.session as string,
-      secretValue: row.secret_value as string,
-      status: row.status as Approval["status"],
-      approvalNonce: row.approval_nonce as string,
-      ip: row.ip as string,
-      createdAt: row.created_at as number,
-      notifiedAt: row.notified_at as number | null,
+      secretId: state.secretId,
+      session: state.session,
+      status: state.status,
+      callbackNonce: state.callbackNonce,
+      ip: state.ip,
+      createdAt: state.createdAt,
+      notifiedAt: state.notifiedAt,
+      expiresAt: state.expiresAt,
+      chatId: state.chatId,
+      messageId: state.messageId,
     };
   }
 
-  private saveApproval(a: Approval): void {
-    this.ctx.storage.sql.exec(
-      `INSERT INTO approval (secret_id, session, secret_value, status, approval_nonce, ip, created_at, notified_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      a.secretId,
-      a.session,
-      a.secretValue,
-      a.status,
-      a.approvalNonce,
-      a.ip,
-      a.createdAt,
-      a.notifiedAt,
-    );
-  }
+  /** Resolve the pending wait() Promise and clean up KV state. */
+  private resolveWait(): Approval {
+    const state = this.loadState()!;
+    const approval = this.toApproval(state);
+    this.ctx.storage.kv.delete(STATE_KEY);
 
-  private updateStatus(
-    secretId: string,
-    session: string,
-    status: Approval["status"],
-  ): void {
-    this.ctx.storage.sql.exec(
-      `UPDATE approval SET status = ? WHERE secret_id = ? AND session = ?`,
-      status,
-      secretId,
-      session,
-    );
-  }
-
-  private updateNotifiedAt(
-    secretId: string,
-    session: string,
-    notifiedAt: number,
-  ): void {
-    this.ctx.storage.sql.exec(
-      `UPDATE approval SET notified_at = ? WHERE secret_id = ? AND session = ?`,
-      notifiedAt,
-      secretId,
-      session,
-    );
-  }
-
-  private resolveWait(approval: Approval): void {
     if (this.waitResolver) {
-      const updated = this.loadApproval(approval.secretId, approval.session);
-      this.waitResolver(updated ?? approval);
+      this.waitResolver(approval);
       this.waitResolver = null;
     }
+    return approval;
   }
 
-  private async notify(approval: Approval): Promise<void> {
-    await sendApprovalMessage(
-      this.env.TELEGRAM_BOT_TOKEN,
-      this.env.TELEGRAM_CHAT_ID,
-      approval.secretId,
-      approval.session,
-      approval.ip,
-      approval.approvalNonce,
-      this.env.SECRETS,
-    );
+  /** Send Telegram notification and store chatId/messageId in state. */
+  private async notify(state: State): Promise<void> {
+    try {
+      const { messageId } = await sendApprovalMessage(
+        this.env.TELEGRAM_BOT_TOKEN,
+        this.env.TELEGRAM_CHAT_ID,
+        state.secretId,
+        state.session,
+        state.ip,
+        state.callbackNonce,
+        state.expiresAt,
+      );
+      // Store message info for later updates (expiration, status)
+      const current = this.loadState();
+      if (current) {
+        this.saveState({
+          ...current,
+          chatId: this.env.TELEGRAM_CHAT_ID,
+          messageId,
+          notifiedAt: Date.now(),
+        });
+      }
+    } catch (err) {
+      console.error("Failed to send Telegram notification:", err);
+    }
   }
 }

@@ -2,6 +2,9 @@ name = "keywa"
 main = "src/index.ts"
 compatibility_date = "2024-04-03"
 
+[vars]
+TIMEOUT_SECONDS = "900"  # 15 minutes, configurable
+
 [[kv_namespaces]]
 binding = "SECRETS"
 id = "TO_BE_FILLED"

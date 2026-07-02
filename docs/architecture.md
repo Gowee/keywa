@@ -15,19 +15,27 @@ Requirements:
 - **Low latency**: approval should be reflected instantly (no polling delay)
 - **Low cost**: no CPU burned while waiting
 
-## Why Durable Objects over KV Polling
+## Storage
 
-The original implementation used KV to store approval state, with the worker polling KV every 5 seconds. This had three problems:
+```
+KV (SECRETS):    secrets only (key-value, eventual consistency OK for list)
+DO KV:           approval state (strongly consistent, single key "state")
+Cookie:          login session (signed, no persistence)
+```
+
+One KV namespace total (secrets only). No sessions KV. No callbacks KV.
+
+The DO uses KV storage (`ctx.storage.kv`) with a single key `"state"`. The secret value is never stored in the DO — the worker re-fetches from KV (SECRETS) after approval.
+
+## Why Durable Objects over KV Polling
 
 | Problem | KV Polling | Durable Objects |
 |---------|-----------|-----------------|
-| **Consistency** | KV has up to 60s eventual consistency. Approval might not be visible for a minute. | DO storage is strongly consistent. Approval is visible instantly. |
-| **CPU cost** | 180 KV reads per 15-min request. Burns through free-tier quotas. | DO holds a Promise in memory. Zero reads while waiting. |
-| **Complexity** | Polling loop with timeout logic, re-reads, state management. | Single `await stub.wait()` call. The DO resolves the Promise when approved. |
+| **Consistency** | KV has up to 60s eventual consistency. | DO storage is strongly consistent. |
+| **CPU cost** | 180 KV reads per 15-min request. | DO holds a Promise in memory. Zero reads while waiting. |
+| **Complexity** | Polling loop with timeout logic. | Single `await stub.wait()` call. |
 
 ### The Long-Polling Pattern
-
-The key insight is that a Durable Object can hold a Promise open across RPC calls:
 
 ```
 Worker                          Durable Object
@@ -38,55 +46,102 @@ Worker                          Durable Object
   │                                │
   │  ... time passes ...           │
   │                                │
-  ├─ stub.approve(token) ────────►│
-  │                                │ calls resolver(approval)
+  ├─ stub.approve(nonce) ────────►│
+  │                                │ validates nonce, resolves Promise
+  │                                │ deletes state from KV
   │◄───────────────────────────────┤
   │   wait() resolved!             │
+  │   re-fetches secret from KV    │
   │   returns key to curl          │
 ```
 
-The DO is free to process `approve()` while `wait()` is pending — RPC doesn't block the DO, only the caller. This is the canonical pattern for request-response coordination in Cloudflare Workers.
+## Naming & Identifiers
 
-### Why Not WebSocket?
+All identifiers use base64url encoding (no padding) for compactness. Hash and nonce are 128-bit.
 
-The client is `curl` in a Linux initrd. It speaks plain HTTP only. WebSocket requires browser-level support or a dedicated WS client, neither of which is available in this environment.
+### DO Name
 
-HTTP long-polling achieves the same result: the client blocks until the response arrives. `curl` handles this natively.
+```
+doName = base64url(SHA-256(secretId + "\0" + session).slice(0, 16))
+```
 
-### Why Not KV with Short Polling?
+- 22 characters, 128-bit collision resistance
+- Deterministic: same (secretId, session) always produces the same name
+- `\0` delimiter is forbidden in both secretId and session (validated on input)
+- The original secretId and session are stored in the DO's KV state for display
 
-Even with 2-3s polling intervals, KV's eventual consistency means there's always a window where the approval has been recorded but isn't visible yet. Durable Objects eliminate this entirely — the approval is in the DO's own storage, and the DO resolves the Promise directly.
+### Callback Nonce
 
-## Why SQLite in the Durable Object
+```
+callbackNonce = base64url(crypto.getRandomValues(new Uint8Array(16)))
+```
 
-Cloudflare recommends SQLite-backed storage for Durable Objects (over the legacy KV API). Benefits:
+- 22 characters, 128-bit entropy
+- CSRF token for the Telegram callback
+- Validated by the DO on approve/deny
 
-- **Strongly consistent**: reads reflect the latest write immediately
-- **Queryable**: SQL queries for listing, filtering, aggregating
-- **Transactional**: `blockConcurrencyWhile()` ensures atomic initialization
-- **Self-contained**: no external storage dependencies
+### Callback Data
 
-The DO uses a single `approval` table with a composite primary key `(secret_id, request_id)`. Each row represents one secret request attempt.
+Telegram's `callback_data` field has a 64-byte limit:
 
-## Why Telegram Callback Buttons (not URL Buttons)
+```
+callback_data = "a:{doName22}:{callbackNonce22}"   # approve (48 bytes)
+                "d:{doName22}:{callbackNonce22}"   # deny (48 bytes)
+```
 
-The original implementation sent Telegram messages with URL buttons that opened a browser tab returning "Approved" as plain text. Problems:
+The DO name hash is embedded directly, so the webhook routes to the correct DO without any KV lookup.
 
-- Requires a browser (not available on all devices)
-- No confirmation feedback (user sees raw text)
-- No deny option
-- URL is guessable if token is weak
+## DO State
 
-Inline callback buttons (`callback_data`) work entirely within Telegram:
+The DO stores a single KV key `"state"` containing:
 
-- Tap Approve/Deny → Telegram sends callback to webhook → worker processes → Telegram shows toast confirmation
-- No browser needed
-- Can show "✅ Approved" or "✗ Denied" as inline feedback
-- `callback_data` is never exposed to the user
+```json
+{
+  "secretId": "my-server-luks",
+  "session": "boot-20260702",
+  "status": "pending",
+  "callbackNonce": "base64url-encoded-22chars",
+  "ip": "203.0.113.42",
+  "createdAt": 1751234567890,
+  "notifiedAt": 1751234568000,
+  "expiresAt": 1751235467890,
+  "chatId": -100123456789,
+  "messageId": 42
+}
+```
+
+### DO Lifecycle
+
+| Phase | Action |
+|-------|--------|
+| `init()` | Store state, set alarm, notify Telegram (captures chatId/messageId) |
+| `wait()` | Hold Promise in memory (zero CPU) |
+| `approve(nonce)` | Validate nonce → set status → resolve wait() → delete state |
+| `deny(nonce)` | Validate nonce → set status → resolve wait() → delete state |
+| `alarm()` | Update Telegram message (⏰ Expired) → resolve wait() → delete state |
+
+**Re-request**: If `init()` is called for a pending (secretId, session), the timeout is refreshed (`setAlarm` replaces the existing alarm) and the Telegram notification is re-sent if expired.
+
+**No secretValue in DO**: The worker fetches the secret from KV (SECRETS) before calling `init()`. After `wait()` resolves as approved, the worker re-fetches from KV. The DO never stores the actual secret.
+
+## Telegram Message
+
+The approval message includes an expiration timestamp:
+
+```
+🔑 Key Request
+
+Secret:  my-server-luks
+Session: boot-20260702
+IP:      203.0.113.42
+Expires: 2026-07-02 12:34 UTC
+
+[✅ Approve] [❌ Deny]
+```
+
+On approval/denial, the message is updated to show the result. On expiration (alarm), the message is updated to show "⏰ Expired" — this is best-effort using stored chatId/messageId.
 
 ## Authentication
-
-keywa has two authentication methods for admin operations, serving different principals:
 
 | | ADMIN_TOKEN | Telegram Login |
 |---|---|---|
@@ -94,88 +149,63 @@ keywa has two authentication methods for admin operations, serving different pri
 | **How** | Static secret in env | Live approval via Telegram |
 | **Where** | CLI, CI/CD, initrd | Browser |
 | **Revocation** | Rotate the secret | Simply don't approve |
-| **Use case** | Automation, initial setup | Day-to-day key management |
 
-Both methods authenticate the same admin API endpoints. The middleware checks:
+Both methods authenticate the same admin API endpoints:
 1. `Authorization: Bearer` header → compare against `ADMIN_TOKEN`
-2. `Cookie: keywa_session` → verify signed JWT
+2. `Cookie: keywa_session` → verify signed JWT (no server-side state)
 3. Neither → reject with 401
-
-### Telegram Login (Approval-Based)
-
-The web admin login uses the same approval pattern as secret retrieval — no OAuth widget, no hash verification:
-
-```
-User visits /admin → clicks "Login"
-  → Worker sends Telegram message "Login from IP x.x.x.x" with Approve button
-  → Page long-polls (same DO pattern as secret retrieval)
-  → User clicks Approve in Telegram
-  → DO resolves, session cookie set, user logged in
-```
-
-This reuses the `KeySessionDO` with a special secretId prefix (`__auth__`) and no secret value. The approval itself IS the authentication — if you can approve in Telegram, you are the admin.
-
-Session cookie: signed JWT stored in KV, 24h TTL, `HttpOnly Secure SameSite=Strict`.
 
 ## Threat Model
 
 | Attack | Mitigation |
 |--------|-----------|
-| Attacker discovers a key ID | Per-key token required; knowing the ID alone is insufficient |
-| Attacker replays a request | Each request gets a unique `approval_nonce`; expired requests auto-deny |
-| Attacker forges a Telegram callback | `approvalNonce` is a UUID (122 bits); webhook secret optional defense-in-depth |
+| Attacker discovers a key ID | Per-key token required |
+| Attacker replays a request | 128-bit `callbackNonce`; expired requests auto-deny and clean up |
+| Attacker forges a Telegram callback | 128-bit random nonce; webhook secret optional defense-in-depth |
 | Attacker brute-forces the key token | Rate limiting at the Worker level |
-| VPS provider reads disk at rest | LUKS encryption (client-side concern, not keywa's) |
-| Key leaked after approval | Keys are returned once; DO state expires via alarm |
-| Attacker forges session cookie | JWT signed with `ADMIN_TOKEN`; tampering invalidates it |
-| Attacker accesses web admin | Login requires Telegram approval; only the admin's Telegram account can approve |
+| Key leaked after approval | Keys returned once; DO state deleted immediately after use |
+| Attacker forges session cookie | JWT signed with `ADMIN_TOKEN`; no server-side state to steal |
+| Attacker accesses web admin | Login requires Telegram approval |
 
 ## Data Flow
-
-### Secret Management (Admin API)
-
-```
-Admin → PUT /admin/api/keys/:keyId (Bearer token or session cookie)
-  → Worker stores { value, token } in KV
-
-Admin → DELETE /admin/api/keys/:keyId
-  → Worker removes from KV
-```
 
 ### Secret Retrieval (Client)
 
 ```
-Client → GET /secret/:keyId?token=KEY_TOKEN
-  → Worker validates access token against KV
-  → Worker gets DO stub for (secretId, session)
-  → DO.init() → sends Telegram notification (if not already notified)
+Client → GET /secret/:secretId?token=KEY_TOKEN
+  → Worker validates token against KV (SECRETS)
+  → Worker computes doName = base64url(SHA-256(secretId + "\0" + session)[0:16])
+  → Worker gets DO stub by hash name
+  → DO.init(secretId, session, ip)
+      → stores state in KV, sets alarm, sends Telegram notification
   → DO.wait() → blocks (Promise held in memory)
   ... admin clicks Approve in Telegram ...
   → Telegram → POST /telegram/webhook
-  → Worker → DO.approve(approvalNonce)
-  → DO resolves wait() Promise
-  → Worker returns secret value to client
-```
-
-### Web Admin Login
-
-```
-Browser → GET /admin → login page
-User clicks "Login" → POST /admin/auth/login
-  → Worker creates DO session for __auth__/{nonce}
-  → DO sends Telegram message "Login request from IP ..."
-  → Page long-polls DO.wait()
-  → Admin clicks Approve in Telegram
-  → DO resolves, Worker sets session cookie
-  → Browser redirects to /admin/dashboard
+  → Worker parses callback_data: "{action}:{doName22}:{callbackNonce22}"
+  → Worker gets DO stub by hash name (no KV lookup)
+  → DO.approve(callbackNonce) → validates, resolves wait(), deletes state
+  → Worker re-fetches secret from KV (SECRETS)
+  → Worker returns secret to client
 ```
 
 ### Approval (Admin via Telegram)
 
 ```
 Telegram → POST /telegram/webhook (callback_query)
-  → Worker parses callback_data: "a:{approvalToken}" or "d:{approvalToken}"
-  → Worker looks up DO name from KV mapping (cb:{approvalNonce})
-  → Worker calls DO.approve(approvalNonce) or DO.deny(approvalNonce)
-  → Worker calls answerCallbackQuery (shows toast in Telegram)
+  → Worker parses callback_data: "{action}:{doName22}:{callbackNonce22}"
+  → Worker gets DO stub by hash name
+  → DO.approve(callbackNonce) or DO.deny(callbackNonce)
+      → validates nonce, returns {ok, approval}
+  → Worker updates Telegram message (shows result)
+  → Worker answers callback query (shows toast)
+```
+
+### DO Expiration (Alarm)
+
+```
+Alarm fires → DO.alarm()
+  → Updates Telegram message to show "⏰ Expired" (best-effort)
+  → Resolves wait() with status "expired"
+  → Deletes state from KV (self-cleanup)
+  → Worker returns "Timeout" (408) to client
 ```
