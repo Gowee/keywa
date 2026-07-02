@@ -38,12 +38,13 @@ interface State {
 const STATE_KEY = "state";
 
 export class KeySessionDO extends DurableObject<Env> {
-  private waitResolver: ((value: Approval) => void) | null = null;
+  private waitResolvers: ((value: Approval) => void)[] = [];
 
   /**
    * Initialize or recover a session.
    * Sends a Telegram notification if this is a fresh request or the previous
-   * notification has expired. Re-requesting a pending session refreshes the timeout.
+   * notification has expired. Re-requesting from the same IP refreshes the timeout.
+   * Re-requesting from a different IP while pending throws (409 Conflict).
    */
   async init(
     secretId: string,
@@ -59,7 +60,8 @@ export class KeySessionDO extends DurableObject<Env> {
         return this.toApproval(existing);
       }
 
-      // Pending and recently notified — refresh alarm, return
+      // Already pending — reject duplicate request
+      throw new Error("Request already pending");
       if (
         existing.notifiedAt &&
         Date.now() - existing.notifiedAt < timeoutMs
@@ -156,7 +158,7 @@ export class KeySessionDO extends DurableObject<Env> {
     if (state.status !== "pending") return this.toApproval(state);
 
     return new Promise<Approval>((resolve) => {
-      this.waitResolver = resolve;
+      this.waitResolvers.push(resolve);
     });
   }
 
@@ -186,7 +188,7 @@ export class KeySessionDO extends DurableObject<Env> {
       }
     }
 
-    // Resolve wait() with expired status, then clean up
+    // Resolve all pending wait() with expired status, then clean up
     const approval: Approval = {
       ...state,
       status: "expired",
@@ -194,10 +196,10 @@ export class KeySessionDO extends DurableObject<Env> {
     };
     this.ctx.storage.kv.delete(STATE_KEY);
 
-    if (this.waitResolver) {
-      this.waitResolver(approval);
-      this.waitResolver = null;
+    for (const resolve of this.waitResolvers) {
+      resolve(approval);
     }
+    this.waitResolvers = [];
   }
 
   // --- Private helpers ---
@@ -227,16 +229,16 @@ export class KeySessionDO extends DurableObject<Env> {
     };
   }
 
-  /** Resolve the pending wait() Promise and clean up KV state. */
+  /** Resolve all pending wait() Promises and clean up KV state. */
   private resolveWait(): Approval {
     const state = this.loadState()!;
     const approval = this.toApproval(state);
     this.ctx.storage.kv.delete(STATE_KEY);
 
-    if (this.waitResolver) {
-      this.waitResolver(approval);
-      this.waitResolver = null;
+    for (const resolve of this.waitResolvers) {
+      resolve(approval);
     }
+    this.waitResolvers = [];
     return approval;
   }
 

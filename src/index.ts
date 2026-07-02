@@ -73,7 +73,13 @@ async function handleSecretRequest(
     doId,
   ) as DurableObjectStub<KeySessionDO>;
 
-  await stub.init(secretId, session, ip);
+  try {
+    await stub.init(secretId, session, ip);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("already pending")) return c.text("Request already pending", 409);
+    throw err;
+  }
   const approval = await stub.wait();
 
   switch (approval.status) {

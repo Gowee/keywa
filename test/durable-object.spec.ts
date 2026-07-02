@@ -97,18 +97,8 @@ describe("KeySessionDO", () => {
     expect(result.status).toBe("denied");
   });
 
-  it("re-request refreshes timeout for pending approval", async () => {
-    const stub = getStub("s8", "r1");
-    const first = await stub.init("s8", "r1", "127.0.0.1");
-
-    // Re-request same session
-    const second = await stub.init("s8", "r1", "10.0.0.1");
-
-    // Same nonce (same request), refreshed expiresAt
-    expect(second.callbackNonce).toBe(first.callbackNonce);
-    expect(second.expiresAt).toBeGreaterThanOrEqual(first.expiresAt);
-    expect(second.status).toBe("pending");
-  });
+  // Note: duplicate pending requests throw "Request already pending",
+  // but testing this via RPC causes unhandled rejection warnings in the CF test pool.
 
   // Note: wait() on non-existent session throws "Session not found",
   // but testing this via RPC causes unhandled rejection warnings in the CF test pool.
