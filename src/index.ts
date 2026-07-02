@@ -37,13 +37,12 @@ async function initDB(db: D1Database): Promise<void> {
 // ---------------------------------------------------------------------------
 
 app.get("/secret/:secretId", (c) => handleSecretRequest(c));
-app.get("/secret/:secretId/:session", (c) => handleSecretRequest(c));
 
 async function handleSecretRequest(
   c: Parameters<Parameters<typeof app.get>[1]>[0],
 ) {
   const secretId = c.req.param("secretId");
-  const session = c.req.param("session") ?? DEFAULT_SESSION;
+  const session = c.req.query("session") || DEFAULT_SESSION;
   const secretToken =
     c.req.query("token") ?? extractBearerToken(c.req.header("Authorization"));
   const ip =

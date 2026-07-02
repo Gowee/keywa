@@ -319,7 +319,7 @@ export function dashboardPage(): string {
       const pre = document.getElementById('curl-example');
       if (id && token) {
         const origin = window.location.origin;
-        pre.textContent = "curl '" + origin + "/secret/" + encodeURIComponent(id) + "?token=" + encodeURIComponent(token) + "'";
+        pre.textContent = "curl -H 'Authorization: Bearer " + token + "' " + origin + "/secret/" + encodeURIComponent(id);
         pre.style.display = 'block';
       } else {
         pre.style.display = 'none';

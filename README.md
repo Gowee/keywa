@@ -86,16 +86,18 @@ curl -X DELETE https://keywa.example.org/admin/api/secrets/mysecret \
 
 ```bash
 # This blocks until approved, denied, or timed out (15 min)
+
+# Via query param
 curl "https://keywa.example.org/secret/mysecret?token=per-secret-credential"
 
 # Or via Bearer header
-curl -H "Authorization: Bearer per-secret-token" "https://keywa.example.org/secret/mysecret"
+curl -H "Authorization: Bearer per-secret-credential" "https://keywa.example.org/secret/mysecret"
 ```
 
 With a named session (for idempotent re-fetching):
 
 ```bash
-curl "https://keywa.example.org/secret/mysecret/my-session?token=per-secret-credential"
+curl -H "Authorization: Bearer per-secret-credential" "https://keywa.example.org/secret/mysecret?session=my-session"
 ```
 
 ### Web Admin
@@ -139,8 +141,7 @@ exit 0
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/secret/:secretId` | `?token=` or `Bearer` | Request secret (long-poll until approved) |
-| GET | `/secret/:secretId/:session` | `?token=` or `Bearer` | Same, with explicit session name |
+| GET | `/secret/:secretId` | `?token=` or `Bearer` | Request secret (long-poll). Optional `?session=` |
 | GET | `/` | — | Health check |
 
 ### Web Admin
