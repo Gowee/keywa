@@ -6,6 +6,9 @@ export interface Env {
   TELEGRAM_WEBHOOK_SECRET?: string;
   ADMIN_TOKEN: string;
   TIMEOUT_SECONDS?: string;
+  DISABLE_TELEGRAM_LOGIN?: string;
+  LOGIN_RATE_LIMIT?: RateLimit;
+  KEY_REQUEST_RATE_LIMIT?: RateLimit;
 }
 
 /** A row from the secrets table. */

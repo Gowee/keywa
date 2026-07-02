@@ -168,6 +168,8 @@ Both methods authenticate the same admin API endpoints:
 2. `Cookie: keywa_session` → verify signed JWT (no server-side state)
 3. Neither → reject with 401
 
+Telegram login can be disabled via `DISABLE_TELEGRAM_LOGIN = "true"` env var. The web admin always accepts `ADMIN_TOKEN` as a fallback.
+
 ## Threat Model
 
 | Attack | Mitigation |
@@ -175,10 +177,11 @@ Both methods authenticate the same admin API endpoints:
 | Attacker discovers a key ID | Per-key token required |
 | Attacker replays a request | 128-bit `callbackNonce`; expired requests auto-deny and clean up |
 | Attacker forges a Telegram callback | 128-bit random nonce; webhook secret optional defense-in-depth |
-| Attacker brute-forces the key token | Rate limiting at the Worker level |
+| Attacker brute-forces the key token | Rate limiting: 10 req/60s per secretId+IP (Rate Limit API) |
 | Key leaked after approval | Keys returned once; DO state deleted immediately after use |
 | Attacker forges session cookie | JWT signed with `ADMIN_TOKEN`; no server-side state to steal |
-| Attacker accesses web admin | Login requires Telegram approval |
+| Attacker floods login endpoint | Rate limiting: 1 login/60s globally (Rate Limit API) |
+| Attacker accesses web admin | Login requires Telegram approval (can be disabled via `DISABLE_TELEGRAM_LOGIN`) |
 
 ## Data Flow
 

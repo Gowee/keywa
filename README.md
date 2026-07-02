@@ -15,7 +15,7 @@ curl GET /secret/mysecret?token=credential → blocks → Telegram notification 
 2. keywa sends a Telegram notification with inline Approve/Deny buttons
 3. `curl` blocks (HTTP long-polling) until the admin acts
 4. Admin clicks Approve → secret is returned to `curl`
-5. Or: admin clicks Deny → `curl` gets 403, or timeout after 15 min → 408
+5. Or: admin clicks Deny → `curl` gets 403, or timeout (default 15 min) → 408
 
 See [docs/architecture.md](docs/architecture.md) for design decisions and why Durable Objects over KV polling.
 
@@ -53,13 +53,25 @@ echo "your-admin-api-key" | pnpm wrangler secret put ADMIN_TOKEN
 echo "some-random-secret" | pnpm wrangler secret put TELEGRAM_WEBHOOK_SECRET
 ```
 
-### 3. Deploy
+### 3. Optional Configuration
+
+In `wrangler.toml`:
+
+```toml
+[vars]
+TIMEOUT_SECONDS = "900"                # approval timeout (default 15 min)
+# DISABLE_TELEGRAM_LOGIN = "true"      # uncomment to disable Telegram login
+```
+
+Rate limits are configured via `[[ratelimits]]` bindings (see `wrangler.toml.sample`).
+
+### 4. Deploy
 
 ```bash
 pnpm deploy
 ```
 
-### 4. Register Telegram Webhook
+### 5. Register Telegram Webhook
 
 ```bash
 curl -X POST https://keywa.example.org/admin/webhook \
@@ -76,6 +88,12 @@ curl -X PUT https://keywa.example.org/admin/api/secrets/mysecret \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"secret": "luks-passphrase", "token": "per-secret-credential"}'
+
+# Update just the value (keep existing token)
+curl -X PUT https://keywa.example.org/admin/api/secrets/mysecret \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"secret": "new-passphrase"}'
 
 # Delete a secret
 curl -X DELETE https://keywa.example.org/admin/api/secrets/mysecret \
@@ -102,13 +120,12 @@ curl -H "Authorization: Bearer per-secret-credential" "https://keywa.example.org
 
 ### Web Admin
 
-Visit `/admin` in a browser. Login is approval-based — same as secret retrieval:
+Visit `/admin` in a browser. Login via Telegram approval or admin token:
 
-1. Click "Login with Telegram"
-2. Approve the notification in Telegram
-3. You're in
+1. Click "Login with Telegram" → approve the notification
+2. Or enter `ADMIN_TOKEN` directly
 
-The dashboard lets you list, add, edit, and delete secrets.
+The dashboard lets you list, add, edit, and delete secrets. Telegram login can be disabled by setting `DISABLE_TELEGRAM_LOGIN = "true"` in `wrangler.toml`.
 
 ### Example: Initrd Unlock Script
 

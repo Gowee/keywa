@@ -49,9 +49,9 @@ th { color: var(--text-muted); font-weight: 500; font-size: 0.8rem; text-transfo
 .btn-primary:hover { background: var(--green-bg-hover); }
 .btn-secondary { background: var(--btn-bg); color: var(--text); border: 1px solid var(--border); }
 .btn-secondary:hover { background: var(--btn-hover); }
-.form-row { display: flex; gap: 0.75rem; align-items: end; margin-bottom: 0.75rem; }
-.form-row label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.85rem; color: var(--text-muted); flex: 1; }
-.form-row input, .form-row textarea { background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem; color: var(--text); font-size: 0.9rem; font-family: inherit; }
+.form-row { display: flex; gap: 0.75rem; align-items: end; margin-bottom: 0.75rem; flex-wrap: wrap; }
+.form-row label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.85rem; color: var(--text-muted); flex: 1; min-width: 0; }
+.form-row input, .form-row textarea { background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem; color: var(--text); font-size: 0.9rem; font-family: inherit; min-width: 0; }
 .form-row input:focus, .form-row textarea:focus { border-color: var(--accent); outline: none; }
 .form-row textarea { resize: vertical; min-height: 2.5rem; }
 .input-with-btn { display: flex; gap: 0.3rem; }
@@ -103,6 +103,7 @@ export function loginPage(): string {
     body { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
     .card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; padding: 2rem; width: 100%; max-width: 420px; text-align: center; }
     h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+    h1 a { color: inherit; text-decoration: none; }
     p { color: var(--text-muted); margin-bottom: 1rem; font-size: 0.9rem; }
     .btn { display: inline-block; padding: 0.65rem 1.2rem; border: none; border-radius: 6px; font-size: 0.9rem; cursor: pointer; font-weight: 500; transition: background 0.2s; }
     .btn-primary { background: var(--green-bg); color: #fff; }
@@ -127,7 +128,7 @@ export function loginPage(): string {
 </head>
 <body>
   <div class="card">
-    <h1>🔐 keywa</h1>
+    <h1><a href="https://github.com/gowee/keywa" target="_blank" rel="noopener">🔐 keywa</a></h1>
     <div id="loading"><p>Checking configuration...</p></div>
     <div id="login-telegram" class="hidden">
       <p>Approve login via Telegram</p>
@@ -163,7 +164,7 @@ export function loginPage(): string {
         const config = await resp.json();
         document.getElementById('loading').style.display = 'none';
 
-        if (config.telegram) {
+        if (config.telegram && !config.telegramDisabled) {
           document.getElementById('login-telegram').classList.remove('hidden');
           document.getElementById('session-id').textContent = sessionId;
         }
@@ -233,6 +234,10 @@ export function loginPage(): string {
         status.className = 'status error';
         status.innerHTML = '⏰ Timed out. Try again.';
         if (_btn) _btn.disabled = false;
+      } else if (data.status === 'rate_limited') {
+        status.className = 'status error';
+        status.innerHTML = '⏳ ' + (data.error || 'Rate limited. Try again shortly.');
+        if (_btn) _btn.disabled = false;
       } else {
         status.className = 'status error';
         status.innerHTML = '⚠️ ' + (data.error || 'Unknown error');
@@ -246,19 +251,26 @@ export function loginPage(): string {
 </html>`;
 }
 
-export function dashboardPage(): string {
+export function dashboardPage(timeoutSeconds: number = 900): string {
+  const timeoutMin = Math.round(timeoutSeconds / 60);
+  const timeoutLabel = timeoutMin >= 60
+    ? Math.round(timeoutMin / 60) + 'h'
+    : timeoutMin + 'm';
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>keywa — Admin</title>
-  <style>${THEME_CSS}</style>
+  <style>${THEME_CSS}
+    .timeout-badge { font-size: 0.75rem; color: var(--text-muted); cursor: help; margin-left: 0.5rem; }
+    .header h1 a { color: inherit; text-decoration: none; }
+  </style>
   <script>${THEME_JS}</script>
 </head>
 <body>
   <div class="header">
-    <h1>🔐 keywa</h1>
+    <h1><a href="https://github.com/gowee/keywa" target="_blank" rel="noopener">🔐 keywa</a> <span class="timeout-badge" title="Approval timeout. Set TIMEOUT_SECONDS env var to change.">⏱ ${timeoutLabel}</span></h1>
     <div class="header-actions">
       <button onclick="registerWebhook()" title="Register Telegram webhook">📡 Webhook</button>
       <button id="theme-btn" onclick="toggleTheme()" title="Toggle theme">🌙</button>
@@ -270,10 +282,12 @@ export function dashboardPage(): string {
       <div class="section-header">
         <h2>Secrets <span id="secret-count" class="count"></span></h2>
       </div>
+      <div style="overflow-x:auto">
       <table>
         <thead><tr><th>ID</th><th>Token</th><th>Updated</th><th>Actions</th></tr></thead>
         <tbody id="secret-list"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
       </table>
+      </div>
     </div>
     <div class="section">
       <div class="section-header"><h2 id="form-title">Add Secret</h2></div>
@@ -285,15 +299,15 @@ export function dashboardPage(): string {
           </label>
           <label>Token
             <div class="input-with-btn">
-              <input id="f-token" placeholder="per-secret access token" maxlength="${LIMITS.token}">
+              <input id="f-token" placeholder="leave empty to keep existing" title="per-secret access token" maxlength="${LIMITS.token}">
               <button class="btn btn-secondary btn-inline" onclick="generateToken()" title="Generate random token">🎲</button>
             </div>
             <div class="char-count"><span id="f-token-count">0</span>/${LIMITS.token}</div>
           </label>
         </div>
         <div class="form-row">
-          <label>Value (leave empty to keep existing)
-            <textarea id="f-value" rows="3" placeholder="secret value" maxlength="${LIMITS.value}"></textarea>
+          <label>Value
+            <textarea id="f-value" rows="3" placeholder="leave empty to keep existing" title="the secret value to store" maxlength="${LIMITS.value}"></textarea>
             <div class="char-count"><span id="f-value-count">0</span>/${LIMITS.value}</div>
           </label>
         </div>
@@ -397,11 +411,13 @@ export function dashboardPage(): string {
       const id = document.getElementById('f-id').value.trim();
       const secret = document.getElementById('f-value').value;
       const token = document.getElementById('f-token').value.trim();
-      if (!id || !token) { toast('Secret ID and Token required', true); return; }
+      if (!id) { toast('Secret ID required', true); return; }
+      if (!token && !secret) { toast('Provide token or value', true); return; }
       if (id.length > ${LIMITS.secretId}) { toast('Secret ID too long (max ${LIMITS.secretId})', true); return; }
-      if (token.length > ${LIMITS.token}) { toast('Token too long (max ${LIMITS.token})', true); return; }
-      if (secret.length > ${LIMITS.value}) { toast('Value too long (max ${LIMITS.value})', true); return; }
-      const body = { token };
+      if (token && token.length > ${LIMITS.token}) { toast('Token too long (max ${LIMITS.token})', true); return; }
+      if (secret && secret.length > ${LIMITS.value}) { toast('Value too long (max ${LIMITS.value})', true); return; }
+      const body = {};
+      if (token) body.token = token;
       if (secret) body.secret = secret;
       try {
         const resp = await fetch(API + '/' + encodeURIComponent(id), {

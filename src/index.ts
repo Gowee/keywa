@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { Env, SecretRow } from "./types";
-import { DEFAULT_SESSION } from "./types";
+import { DEFAULT_SESSION, getTimeoutMs } from "./types";
 import {
   parseCallbackData,
   answerCallbackQuery,
@@ -64,6 +64,14 @@ async function handleSecretRequest(
   ).bind(secretId).first<SecretRow>();
   if (!row) return c.text("Secret not found", 404);
   if (row.token !== secretToken) return c.text("Invalid token", 403);
+
+  // Rate limit: 10 requests per 60s per secretId+IP
+  if (c.env.KEY_REQUEST_RATE_LIMIT) {
+    const { success } = await c.env.KEY_REQUEST_RATE_LIMIT.limit({
+      key: secretId + ":" + ip,
+    });
+    if (!success) return c.text("Too many requests", 429);
+  }
 
   // DO does NOT store the secret — we re-fetch from D1 after approval
   const name = await doName(secretId, session);
@@ -199,9 +207,12 @@ app.post("/telegram/webhook", async (c) => {
 
 // Config status — lets the login page know what's available
 app.get("/admin/status", (c) => {
-  return c.json({
-    telegram: !!(c.env.TELEGRAM_BOT_TOKEN && c.env.TELEGRAM_CHAT_ID),
-  });
+  const telegram = !!(c.env.TELEGRAM_BOT_TOKEN && c.env.TELEGRAM_CHAT_ID);
+  const telegramDisabled = c.env.DISABLE_TELEGRAM_LOGIN === "true";
+  const timeoutSeconds = getTimeoutMs(c.env) / 1000;
+  // Rate limit status is reported by the login endpoint on failure;
+  // we don't call limit() here to avoid consuming a slot.
+  return c.json({ telegram, telegramDisabled, timeoutSeconds });
 });
 
 // Token-based login — fallback when Telegram is not configured
@@ -238,7 +249,8 @@ app.get("/admin", async (c) => {
 app.get("/admin/dashboard", async (c) => {
   const userId = await verifySession(c.req.raw, c.env.ADMIN_TOKEN);
   if (!userId) return c.redirect("/admin");
-  return c.html(dashboardPage());
+  const timeoutSeconds = getTimeoutMs(c.env) / 1000;
+  return c.html(dashboardPage(timeoutSeconds));
 });
 
 app.post("/admin/auth/login", async (c) => {
@@ -247,6 +259,17 @@ app.post("/admin/auth/login", async (c) => {
       c.req.header("CF-Connecting-IP") ??
       c.req.header("X-Forwarded-For") ??
       "unknown";
+
+    // Rate limit: 1 attempt per 60s globally
+    if (c.env.LOGIN_RATE_LIMIT) {
+      const { success } = await c.env.LOGIN_RATE_LIMIT.limit({ key: "telegram-login" });
+      if (!success) {
+        return c.json(
+          { status: "rate_limited", error: "Too many login attempts. Try again in a minute." },
+          429,
+        );
+      }
+    }
 
     // Accept session name from client (for verification display) or generate one
     const body = await c.req.json<{ session?: string }>().catch(() => ({}));
@@ -325,31 +348,29 @@ app.put("/admin/api/secrets/:secretId", async (c) => {
 
   const body = await c.req.json<{ secret?: string; token?: string }>();
 
-  if (!body.token) return c.text("token required", 400);
-  if (body.token.length > LIMITS.token)
+  if (body.token === undefined && body.secret === undefined)
+    return c.text("at least one of token or secret required", 400);
+  if (body.token !== undefined && body.token.length > LIMITS.token)
     return c.text(`token too long (max ${LIMITS.token})`, 400);
   if (body.secret !== undefined && body.secret.length > LIMITS.value)
     return c.text(`secret too long (max ${LIMITS.value})`, 400);
 
-  // Partial update: if secret is not provided, keep the existing value
-  let secretValue: string;
-  if (body.secret !== undefined) {
-    secretValue = body.secret;
-  } else {
-    const existing = await c.env.DB.prepare(
-      "SELECT secret FROM secrets WHERE id = ?",
-    ).bind(secretId).first<{ secret: string }>();
-    if (!existing)
-      return c.text(
-        "Secret not found — cannot update token without existing secret",
-        404,
-      );
-    secretValue = existing.secret;
-  }
+  // Fetch existing row for partial updates
+  const existing = await c.env.DB.prepare(
+    "SELECT secret, token FROM secrets WHERE id = ?",
+  ).bind(secretId).first<{ secret: string; token: string }>();
+
+  if (!existing && body.secret === undefined)
+    return c.text("Secret not found — provide a value to create", 404);
+  if (!existing && body.token === undefined)
+    return c.text("Secret not found — provide a token to create", 404);
+
+  const secretValue = body.secret ?? existing!.secret;
+  const tokenValue = body.token ?? existing!.token;
 
   await c.env.DB.prepare(
     "INSERT OR REPLACE INTO secrets (id, secret, token, updated_at) VALUES (?, ?, ?, ?)",
-  ).bind(secretId, secretValue, body.token, Date.now()).run();
+  ).bind(secretId, secretValue, tokenValue, Date.now()).run();
 
   return c.json({ ok: true, secretId });
 });

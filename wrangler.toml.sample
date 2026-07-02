@@ -4,6 +4,7 @@ compatibility_date = "2024-04-03"
 
 [vars]
 TIMEOUT_SECONDS = "900"  # 15 minutes, configurable
+# DISABLE_TELEGRAM_LOGIN = "true"  # uncomment to disable Telegram login
 
 [[d1_databases]]
 binding = "DB"
@@ -18,6 +19,20 @@ class_name = "KeySessionDO"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["KeySessionDO"]
+
+[[ratelimits]]
+name = "LOGIN_RATE_LIMIT"
+namespace_id = "1"
+  [ratelimits.simple]
+  limit = 1
+  period = 60
+
+[[ratelimits]]
+name = "KEY_REQUEST_RATE_LIMIT"
+namespace_id = "2"
+  [ratelimits.simple]
+  limit = 10
+  period = 60
 
 # Required secrets (set via `echo VALUE | pnpm wrangler secret put NAME`):
 # - TELEGRAM_BOT_TOKEN
