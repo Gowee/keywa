@@ -54,6 +54,9 @@ th { color: var(--text-muted); font-weight: 500; font-size: 0.8rem; text-transfo
 .form-row input, .form-row textarea { background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem; color: var(--text); font-size: 0.9rem; font-family: inherit; }
 .form-row input:focus, .form-row textarea:focus { border-color: var(--accent); outline: none; }
 .form-row textarea { resize: vertical; min-height: 2.5rem; }
+.input-with-btn { display: flex; gap: 0.3rem; }
+.input-with-btn input { flex: 1; }
+.input-with-btn .btn-inline { padding: 0.5rem 0.6rem; font-size: 0.75rem; white-space: nowrap; }
 .char-count { font-size: 0.75rem; color: var(--text-muted); text-align: right; margin-top: 0.2rem; }
 .empty { padding: 2rem; text-align: center; color: var(--text-muted); }
 .toast { position: fixed; bottom: 1rem; right: 1rem; background: var(--toast-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 1rem; font-size: 0.85rem; z-index: 100; transition: opacity 0.3s; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
@@ -281,7 +284,10 @@ export function dashboardPage(): string {
             <div class="char-count"><span id="f-id-count">0</span>/${LIMITS.secretId}</div>
           </label>
           <label>Token
-            <input id="f-token" placeholder="per-secret access token" maxlength="${LIMITS.token}">
+            <div class="input-with-btn">
+              <input id="f-token" placeholder="per-secret access token" maxlength="${LIMITS.token}">
+              <button class="btn btn-secondary btn-inline" onclick="generateToken()" title="Generate random token">🎲</button>
+            </div>
             <div class="char-count"><span id="f-token-count">0</span>/${LIMITS.token}</div>
           </label>
         </div>
@@ -292,7 +298,6 @@ export function dashboardPage(): string {
           </label>
         </div>
         <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
-          <button class="btn btn-secondary" onclick="generateToken()">Generate Token</button>
           <button class="btn btn-secondary" onclick="clearForm()">Clear</button>
           <button class="btn btn-primary" onclick="saveSecret()">Save</button>
         </div>
