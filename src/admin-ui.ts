@@ -30,14 +30,17 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 .header-actions { display: flex; gap: 0.5rem; align-items: center; }
 .header button { background: var(--btn-bg); color: var(--text); border: 1px solid var(--border); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
 .header button:hover { background: var(--btn-hover); }
-.container { max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+.container { max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
 .section { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 1.5rem; }
 .section-header { padding: 1rem 1.25rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
 .section-header h2 { font-size: 1rem; }
+.section-header .count { font-size: 0.85rem; color: var(--text-muted); font-weight: normal; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 0.75rem 1.25rem; text-align: left; border-bottom: 1px solid var(--border-light); font-size: 0.9rem; }
-th { color: var(--text-muted); font-weight: 500; }
+th { color: var(--text-muted); font-weight: 500; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
 .mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.85rem; }
+.muted { color: var(--text-muted); font-size: 0.82rem; }
+.actions { white-space: nowrap; }
 .actions button { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 0.85rem; padding: 0.2rem 0.5rem; }
 .actions button:hover { text-decoration: underline; }
 .actions button.danger { color: var(--red); }
@@ -53,9 +56,11 @@ th { color: var(--text-muted); font-weight: 500; }
 .form-row textarea { resize: vertical; min-height: 2.5rem; }
 .char-count { font-size: 0.75rem; color: var(--text-muted); text-align: right; margin-top: 0.2rem; }
 .empty { padding: 2rem; text-align: center; color: var(--text-muted); }
-.toast { position: fixed; bottom: 1rem; right: 1rem; background: var(--toast-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 1rem; font-size: 0.85rem; z-index: 100; transition: opacity 0.3s; }
+.toast { position: fixed; bottom: 1rem; right: 1rem; background: var(--toast-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 1rem; font-size: 0.85rem; z-index: 100; transition: opacity 0.3s; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
 .toast.error { border-color: var(--red); }
 .toast.success { border-color: var(--green); }
+.curl-example { margin-top: 0.75rem; padding: 0.5rem 0.75rem; border-radius: 4px; font-size: 0.75rem; white-space: pre-wrap; word-break: break-all; cursor: pointer; color: var(--text-muted); opacity: 0.7; background: var(--bg-input); border: 1px solid var(--border); }
+.curl-example:hover { opacity: 1; }
 `;
 
 const THEME_JS = `
@@ -159,11 +164,8 @@ export function loginPage(): string {
           document.getElementById('login-telegram').classList.remove('hidden');
           document.getElementById('session-id').textContent = sessionId;
         }
-        // Always show token login as fallback
         document.getElementById('login-token').classList.remove('hidden');
-
         if (!config.telegram) {
-          // Show setup guide alongside token login
           document.getElementById('setup-guide').classList.remove('hidden');
         }
       } catch (e) {
@@ -263,15 +265,15 @@ export function dashboardPage(): string {
   <div class="container">
     <div class="section">
       <div class="section-header">
-        <h2>Secrets</h2>
+        <h2>Secrets <span id="secret-count" class="count"></span></h2>
       </div>
       <table>
-        <thead><tr><th>ID</th><th>Token</th><th>Actions</th></tr></thead>
-        <tbody id="secret-list"><tr><td colspan="3" class="empty">Loading...</td></tr></tbody>
+        <thead><tr><th>ID</th><th>Token</th><th>Updated</th><th>Actions</th></tr></thead>
+        <tbody id="secret-list"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
       </table>
     </div>
     <div class="section">
-      <div class="section-header"><h2>Add / Edit Secret</h2></div>
+      <div class="section-header"><h2 id="form-title">Add Secret</h2></div>
       <div style="padding: 1rem 1.25rem;">
         <div class="form-row">
           <label>Secret ID
@@ -291,9 +293,10 @@ export function dashboardPage(): string {
         </div>
         <div style="display:flex; gap:0.5rem; justify-content:flex-end;">
           <button class="btn btn-secondary" onclick="generateToken()">Generate Token</button>
+          <button class="btn btn-secondary" onclick="clearForm()">Clear</button>
           <button class="btn btn-primary" onclick="saveSecret()">Save</button>
         </div>
-        <pre id="curl-example" class="mono" style="display:none; margin-top:0.75rem; padding:0.4rem 0.5rem; border-radius:4px; font-size:0.75rem; white-space:pre-wrap; word-break:break-all; cursor:pointer; color:var(--text-muted); opacity:0.6;" title="Click to select · double-click to copy" onclick="selectCurl(this)" ondblclick="copyCurl(this)"></pre>
+        <pre id="curl-example" class="curl-example" style="display:none" title="Click to select · double-click to copy" onclick="selectCurl(this)" ondblclick="copyCurl(this)"></pre>
       </div>
     </div>
   </div>
@@ -339,24 +342,41 @@ export function dashboardPage(): string {
       );
     }
 
-    let cachedSecrets = [];
-
     function renderSecrets(secrets) {
-      cachedSecrets = secrets;
       const tbody = document.getElementById('secret-list');
-      if (!secrets.length) { tbody.innerHTML = '<tr><td colspan="3" class="empty">No secrets</td></tr>'; return; }
+      const count = document.getElementById('secret-count');
+      count.textContent = secrets.length ? '(' + secrets.length + ')' : '';
+
+      if (!secrets.length) {
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">No secrets</td></tr>';
+        return;
+      }
+
       tbody.innerHTML = secrets.map(s => {
-        const tok = s.token || s.auth || '';
+        const tok = s.token || '';
         const masked = tok.length >= 8 ? tok.slice(0,4) + '****' + tok.slice(-4) : tok ? '****' : '(none)';
+        const updated = s.updated_at ? timeAgo(s.updated_at) : '—';
         return '<tr>' +
           '<td class="mono">' + esc(s.id) + '</td>' +
           '<td class="mono">' + esc(masked) + '</td>' +
+          '<td class="muted">' + esc(updated) + '</td>' +
           '<td class="actions">' +
             '<button onclick="editSecret(this.dataset.id)" data-id="' + escAttr(s.id) + '">Edit</button> ' +
             '<button class="danger" onclick="deleteSecret(this.dataset.id)" data-id="' + escAttr(s.id) + '">Delete</button>' +
           '</td>' +
         '</tr>';
       }).join('');
+    }
+
+    function timeAgo(ms) {
+      const sec = Math.floor((Date.now() - ms) / 1000);
+      if (sec < 60) return 'just now';
+      const min = Math.floor(sec / 60);
+      if (min < 60) return min + 'm ago';
+      const hr = Math.floor(min / 60);
+      if (hr < 24) return hr + 'h ago';
+      const d = Math.floor(hr / 24);
+      return d + 'd ago';
     }
 
     async function loadSecrets() {
@@ -367,9 +387,6 @@ export function dashboardPage(): string {
         renderSecrets(await resp.json());
       } catch (e) { toast('Failed to load secrets: ' + e.message, true); }
     }
-
-    // Background re-fetch after optimistic update (KV eventual consistency)
-    function backgroundRefresh() { setTimeout(loadSecrets, 2000); }
 
     async function saveSecret() {
       const id = document.getElementById('f-id').value.trim();
@@ -389,17 +406,8 @@ export function dashboardPage(): string {
         });
         if (resp.ok) {
           toast('Saved');
-          // Optimistic update: add/update in local list immediately
-          const existing = cachedSecrets.findIndex(s => s.id === id);
-          const entry = { id, token };
-          if (existing >= 0) cachedSecrets[existing] = entry;
-          else cachedSecrets.push(entry);
-          renderSecrets(cachedSecrets);
-          document.getElementById('f-id').value = '';
-          document.getElementById('f-value').value = '';
-          document.getElementById('f-token').value = '';
-          updateCounters();
-          backgroundRefresh();
+          clearForm();
+          await loadSecrets();
         }
         else { toast('Save failed: ' + (await resp.text()), true); }
       } catch (e) { toast('Network error', true); }
@@ -411,10 +419,7 @@ export function dashboardPage(): string {
         const resp = await fetch(API + '/' + encodeURIComponent(id), { method: 'DELETE' });
         if (resp.ok) {
           toast('Deleted');
-          // Optimistic update: remove from local list immediately
-          cachedSecrets = cachedSecrets.filter(s => s.id !== id);
-          renderSecrets(cachedSecrets);
-          backgroundRefresh();
+          await loadSecrets();
         }
         else { toast('Delete failed', true); }
       } catch (e) { toast('Network error', true); }
@@ -422,7 +427,17 @@ export function dashboardPage(): string {
 
     function editSecret(id) {
       document.getElementById('f-id').value = id;
+      document.getElementById('form-title').textContent = 'Edit Secret';
       document.getElementById('f-token').focus();
+      updateCounters();
+      updateCurlExample();
+    }
+
+    function clearForm() {
+      document.getElementById('f-id').value = '';
+      document.getElementById('f-value').value = '';
+      document.getElementById('f-token').value = '';
+      document.getElementById('form-title').textContent = 'Add Secret';
       updateCounters();
       updateCurlExample();
     }

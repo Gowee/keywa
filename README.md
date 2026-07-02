@@ -35,11 +35,11 @@ pnpm install
 cp wrangler.toml.sample wrangler.toml
 ```
 
-Edit `wrangler.toml` and fill in your KV namespace ID:
+Edit `wrangler.toml` and fill in your D1 database ID:
 
 ```bash
-pnpm wrangler kv namespace create SECRETS
-# Copy the id into wrangler.toml
+pnpm wrangler d1 create keywa
+# Copy the database_id into wrangler.toml
 ```
 
 ### 2. Set Secrets
@@ -159,7 +159,7 @@ All admin endpoints accept either `Authorization: Bearer $ADMIN_TOKEN` or a sess
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/admin/api/secrets` | List secrets (JSON) |
-| PUT | `/admin/api/secrets/:secretId` | Add/update secret (`{secret, auth}` body) |
+| PUT | `/admin/api/secrets/:secretId` | Add/update secret (`{secret, token}` body) |
 | DELETE | `/admin/api/secrets/:secretId` | Delete secret |
 | POST | `/admin/webhook` | Register Telegram webhook |
 

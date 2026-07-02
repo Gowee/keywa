@@ -1,5 +1,5 @@
 export interface Env {
-  SECRETS: KVNamespace;
+  DB: D1Database;
   KEY_SESSION_DO: DurableObjectNamespace;
   TELEGRAM_BOT_TOKEN: string;
   TELEGRAM_CHAT_ID: string;
@@ -8,10 +8,12 @@ export interface Env {
   TIMEOUT_SECONDS?: string;
 }
 
-/** A secret stored in KV */
-export interface StoredSecret {
+/** A row from the secrets table. */
+export interface SecretRow {
+  id: string;
   secret: string;
   token: string;
+  updated_at: number;
 }
 
 /** The state of an approval request, persisted in DO KV. */

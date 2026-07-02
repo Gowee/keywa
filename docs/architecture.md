@@ -18,14 +18,27 @@ Requirements:
 ## Storage
 
 ```
-KV (SECRETS):    secrets only (key-value, eventual consistency OK for list)
+D1 (DB):         secrets table (strongly consistent, SQL)
 DO KV:           approval state (strongly consistent, single key "state")
 Cookie:          login session (signed, no persistence)
 ```
 
-One KV namespace total (secrets only). No sessions KV. No callbacks KV.
+No KV namespaces. All persistent storage is D1 or DO-local.
 
-The DO uses KV storage (`ctx.storage.kv`) with a single key `"state"`. The secret value is never stored in the DO — the worker re-fetches from KV (SECRETS) after approval.
+The DO uses KV storage (`ctx.storage.kv`) with a single key `"state"`. The secret value is never stored in the DO — the worker re-fetches from D1 after approval.
+
+### D1 Schema
+
+```sql
+CREATE TABLE IF NOT EXISTS secrets (
+  id         TEXT PRIMARY KEY,
+  secret     TEXT NOT NULL,
+  token      TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+```
+
+D1 provides strongly consistent reads — no eventual consistency delay for the admin dashboard.
 
 ## Why Durable Objects over KV Polling
 
@@ -51,7 +64,7 @@ Worker                          Durable Object
   │                                │ deletes state from KV
   │◄───────────────────────────────┤
   │   wait() resolved!             │
-  │   re-fetches secret from KV    │
+  │   re-fetches secret from D1    │
   │   returns key to curl          │
 ```
 
@@ -122,7 +135,7 @@ The DO stores a single KV key `"state"` containing:
 
 **Re-request**: If `init()` is called for a pending (secretId, session), the timeout is refreshed (`setAlarm` replaces the existing alarm) and the Telegram notification is re-sent if expired.
 
-**No secretValue in DO**: The worker fetches the secret from KV (SECRETS) before calling `init()`. After `wait()` resolves as approved, the worker re-fetches from KV. The DO never stores the actual secret.
+**No secretValue in DO**: The worker fetches the secret from D1 before calling `init()`. After `wait()` resolves as approved, the worker re-fetches from D1. The DO never stores the actual secret.
 
 ## Telegram Message
 
@@ -173,18 +186,18 @@ Both methods authenticate the same admin API endpoints:
 
 ```
 Client → GET /secret/:secretId?token=KEY_TOKEN
-  → Worker validates token against KV (SECRETS)
+  → Worker validates token against D1
   → Worker computes doName = base64url(SHA-256(secretId + "\0" + session)[0:16])
   → Worker gets DO stub by hash name
   → DO.init(secretId, session, ip)
-      → stores state in KV, sets alarm, sends Telegram notification
+      → stores state in DO KV, sets alarm, sends Telegram notification
   → DO.wait() → blocks (Promise held in memory)
   ... admin clicks Approve in Telegram ...
   → Telegram → POST /telegram/webhook
   → Worker parses callback_data: "{action}:{doName22}:{callbackNonce22}"
-  → Worker gets DO stub by hash name (no KV lookup)
+  → Worker gets DO stub by hash name (no lookup needed)
   → DO.approve(callbackNonce) → validates, resolves wait(), deletes state
-  → Worker re-fetches secret from KV (SECRETS)
+  → Worker re-fetches secret from D1
   → Worker returns secret to client
 ```
 
@@ -206,6 +219,6 @@ Telegram → POST /telegram/webhook (callback_query)
 Alarm fires → DO.alarm()
   → Updates Telegram message to show "⏰ Expired" (best-effort)
   → Resolves wait() with status "expired"
-  → Deletes state from KV (self-cleanup)
+  → Deletes state from DO KV (self-cleanup)
   → Worker returns "Timeout" (408) to client
 ```

@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import type { Env, StoredSecret } from "./types";
+import type { Env, SecretRow } from "./types";
 import { DEFAULT_SESSION } from "./types";
 import {
   parseCallbackData,
@@ -23,6 +23,13 @@ const app = new Hono<{ Bindings: Env }>();
 function rejectNullByte(value: string, label: string): string | null {
   if (value.includes("\0")) return `${label} must not contain null byte`;
   return null;
+}
+
+/** Initialize the D1 secrets table. Safe to call multiple times. */
+async function initDB(db: D1Database): Promise<void> {
+  await db.prepare(
+    "CREATE TABLE IF NOT EXISTS secrets (id TEXT PRIMARY KEY, secret TEXT NOT NULL, token TEXT NOT NULL, updated_at INTEGER NOT NULL)",
+  ).run();
 }
 
 // ---------------------------------------------------------------------------
@@ -53,19 +60,13 @@ async function handleSecretRequest(
     return c.text("token required (query param or Bearer header)", 401);
 
   // Validate secret exists and token matches (before blocking on DO)
-  const raw = await c.env.SECRETS.get(secretId);
-  if (!raw) return c.text("Secret not found", 404);
+  const row = await c.env.DB.prepare(
+    "SELECT secret, token FROM secrets WHERE id = ?",
+  ).bind(secretId).first<SecretRow>();
+  if (!row) return c.text("Secret not found", 404);
+  if (row.token !== secretToken) return c.text("Invalid token", 403);
 
-  let stored: StoredSecret;
-  try {
-    stored = JSON.parse(raw) as StoredSecret;
-  } catch {
-    return c.text("Secret format invalid", 500);
-  }
-
-  if (stored.token !== secretToken) return c.text("Invalid token", 403);
-
-  // DO does NOT store the secret — we re-fetch from KV after approval
+  // DO does NOT store the secret — we re-fetch from D1 after approval
   const name = await doName(secretId, session);
   const doId = c.env.KEY_SESSION_DO.idFromName(name);
   const stub = c.env.KEY_SESSION_DO.get(
@@ -77,15 +78,12 @@ async function handleSecretRequest(
 
   switch (approval.status) {
     case "approved": {
-      // Re-fetch secret from KV (DO doesn't store it)
-      const freshRaw = await c.env.SECRETS.get(secretId);
-      if (!freshRaw) return c.text("Secret deleted", 410);
-      try {
-        const fresh = JSON.parse(freshRaw) as StoredSecret;
-        return c.text(fresh.secret);
-      } catch {
-        return c.text("Secret format invalid", 500);
-      }
+      // Re-fetch secret from D1 (DO doesn't store it)
+      const fresh = await c.env.DB.prepare(
+        "SELECT secret FROM secrets WHERE id = ?",
+      ).bind(secretId).first<{ secret: string }>();
+      if (!fresh) return c.text("Secret deleted", 410);
+      return c.text(fresh.secret);
     }
     case "denied":
       return c.text("Denied", 403);
@@ -303,20 +301,11 @@ app.post("/admin/auth/logout", async (_c) => {
 app.get("/admin/api/secrets", async (c) => {
   if (!(await isAdmin(c))) return c.text("Unauthorized", 401);
 
-  const list = await c.env.SECRETS.list();
-  const secrets = [];
-  for (const key of list.keys) {
-    const raw = await c.env.SECRETS.get(key.name);
-    if (!raw) continue;
-    try {
-      const stored = JSON.parse(raw) as StoredSecret;
-      secrets.push({ id: key.name, token: stored.token });
-    } catch {
-      // skip malformed entries
-    }
-  }
+  const { results } = await c.env.DB.prepare(
+    "SELECT id, token, updated_at FROM secrets ORDER BY updated_at DESC",
+  ).all<{ id: string; token: string; updated_at: number }>();
 
-  return c.json(secrets);
+  return c.json(results ?? []);
 });
 
 const LIMITS = { secretId: 128, session: 128, token: 128, value: 65536 };
@@ -342,22 +331,20 @@ app.put("/admin/api/secrets/:secretId", async (c) => {
   if (body.secret !== undefined) {
     secretValue = body.secret;
   } else {
-    const existing = await c.env.SECRETS.get(secretId);
+    const existing = await c.env.DB.prepare(
+      "SELECT secret FROM secrets WHERE id = ?",
+    ).bind(secretId).first<{ secret: string }>();
     if (!existing)
       return c.text(
         "Secret not found — cannot update token without existing secret",
         404,
       );
-    try {
-      const stored = JSON.parse(existing) as StoredSecret;
-      secretValue = stored.secret;
-    } catch {
-      return c.text("Existing secret format invalid", 500);
-    }
+    secretValue = existing.secret;
   }
 
-  const stored: StoredSecret = { secret: secretValue, token: body.token };
-  await c.env.SECRETS.put(secretId, JSON.stringify(stored));
+  await c.env.DB.prepare(
+    "INSERT OR REPLACE INTO secrets (id, secret, token, updated_at) VALUES (?, ?, ?, ?)",
+  ).bind(secretId, secretValue, body.token, Date.now()).run();
 
   return c.json({ ok: true, secretId });
 });
@@ -368,7 +355,7 @@ app.delete("/admin/api/secrets/:secretId", async (c) => {
   const secretId = c.req.param("secretId");
   if (!secretId) return c.text("secretId required", 400);
 
-  await c.env.SECRETS.delete(secretId);
+  await c.env.DB.prepare("DELETE FROM secrets WHERE id = ?").bind(secretId).run();
   return c.json({ ok: true, secretId });
 });
 
@@ -402,7 +389,11 @@ app.post("/admin/webhook", async (c) => {
 // Health
 // ---------------------------------------------------------------------------
 
-app.get("/", (c) => c.text("ok"));
+app.get("/", async (c) => {
+  // Initialize D1 table on first request
+  await initDB(c.env.DB);
+  return c.text("ok");
+});
 
 // ---------------------------------------------------------------------------
 // Helpers
