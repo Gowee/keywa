@@ -27,9 +27,11 @@ function rejectNullByte(value: string, label: string): string | null {
 
 /** Initialize the D1 secrets table. Safe to call multiple times. */
 async function initDB(db: D1Database): Promise<void> {
-  await db.prepare(
-    "CREATE TABLE IF NOT EXISTS secrets (id TEXT PRIMARY KEY, secret TEXT NOT NULL, token TEXT NOT NULL, updated_at INTEGER NOT NULL)",
-  ).run();
+  await db
+    .prepare(
+      "CREATE TABLE IF NOT EXISTS secrets (id TEXT PRIMARY KEY, secret TEXT NOT NULL, token TEXT NOT NULL, updated_at INTEGER NOT NULL)",
+    )
+    .run();
 }
 
 // ---------------------------------------------------------------------------
@@ -51,9 +53,12 @@ async function handleSecretRequest(
     "unknown";
 
   if (!secretId) return c.text("secretId required", 400);
-  if (secretId.length > LIMITS.secretId) return c.text(`secretId too long (max ${LIMITS.secretId})`, 400);
-  if (session.length > LIMITS.session) return c.text(`session too long (max ${LIMITS.session})`, 400);
-  const nullErr = rejectNullByte(secretId, "secretId") || rejectNullByte(session, "session");
+  if (secretId.length > LIMITS.secretId)
+    return c.text(`secretId too long (max ${LIMITS.secretId})`, 400);
+  if (session.length > LIMITS.session)
+    return c.text(`session too long (max ${LIMITS.session})`, 400);
+  const nullErr =
+    rejectNullByte(secretId, "secretId") || rejectNullByte(session, "session");
   if (nullErr) return c.text(nullErr, 400);
   if (!secretToken)
     return c.text("token required (query param or Bearer header)", 401);
@@ -61,7 +66,9 @@ async function handleSecretRequest(
   // Validate secret exists and token matches (before blocking on DO)
   const row = await c.env.DB.prepare(
     "SELECT secret, token FROM secrets WHERE id = ?",
-  ).bind(secretId).first<SecretRow>();
+  )
+    .bind(secretId)
+    .first<SecretRow>();
   if (!row) return c.text("Secret not found", 404);
   if (row.token !== secretToken) return c.text("Invalid token", 403);
 
@@ -84,7 +91,8 @@ async function handleSecretRequest(
     await stub.init(secretId, session, ip);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes("already pending")) return c.text("Request already pending", 409);
+    if (msg.includes("already pending"))
+      return c.text("Request already pending", 409);
     throw err;
   }
   const approval = await stub.wait();
@@ -94,7 +102,9 @@ async function handleSecretRequest(
       // Re-fetch secret from D1 (DO doesn't store it)
       const fresh = await c.env.DB.prepare(
         "SELECT secret FROM secrets WHERE id = ?",
-      ).bind(secretId).first<{ secret: string }>();
+      )
+        .bind(secretId)
+        .first<{ secret: string }>();
       if (!fresh) return c.text("Secret deleted", 410);
       return c.text(fresh.secret);
     }
@@ -262,10 +272,15 @@ app.post("/admin/auth/login", async (c) => {
 
     // Rate limit: 1 attempt per 60s globally
     if (c.env.LOGIN_RATE_LIMIT) {
-      const { success } = await c.env.LOGIN_RATE_LIMIT.limit({ key: "telegram-login" });
+      const { success } = await c.env.LOGIN_RATE_LIMIT.limit({
+        key: "telegram-login",
+      });
       if (!success) {
         return c.json(
-          { status: "rate_limited", error: "Too many login attempts. Try again in a minute." },
+          {
+            status: "rate_limited",
+            error: "Too many login attempts. Try again in a minute.",
+          },
           429,
         );
       }
@@ -276,8 +291,10 @@ app.post("/admin/auth/login", async (c) => {
     const nonce = crypto.randomUUID().slice(0, 8);
     const secretId = `__auth__`;
     let session = body.session || `login-${nonce}`;
-    if (session.length > LIMITS.session) session = session.slice(0, LIMITS.session);
-    if (session.includes("\0")) return c.text("session must not contain null byte", 400);
+    if (session.length > LIMITS.session)
+      session = session.slice(0, LIMITS.session);
+    if (session.includes("\0"))
+      return c.text("session must not contain null byte", 400);
 
     const name = await doName(secretId, session);
     const doId = c.env.KEY_SESSION_DO.idFromName(name);
@@ -358,7 +375,9 @@ app.put("/admin/api/secrets/:secretId", async (c) => {
   // Fetch existing row for partial updates
   const existing = await c.env.DB.prepare(
     "SELECT secret, token FROM secrets WHERE id = ?",
-  ).bind(secretId).first<{ secret: string; token: string }>();
+  )
+    .bind(secretId)
+    .first<{ secret: string; token: string }>();
 
   if (!existing && body.secret === undefined)
     return c.text("Secret not found — provide a value to create", 404);
@@ -370,7 +389,9 @@ app.put("/admin/api/secrets/:secretId", async (c) => {
 
   await c.env.DB.prepare(
     "INSERT OR REPLACE INTO secrets (id, secret, token, updated_at) VALUES (?, ?, ?, ?)",
-  ).bind(secretId, secretValue, tokenValue, Date.now()).run();
+  )
+    .bind(secretId, secretValue, tokenValue, Date.now())
+    .run();
 
   return c.json({ ok: true, secretId });
 });
@@ -381,7 +402,9 @@ app.delete("/admin/api/secrets/:secretId", async (c) => {
   const secretId = c.req.param("secretId");
   if (!secretId) return c.text("secretId required", 400);
 
-  await c.env.DB.prepare("DELETE FROM secrets WHERE id = ?").bind(secretId).run();
+  await c.env.DB.prepare("DELETE FROM secrets WHERE id = ?")
+    .bind(secretId)
+    .run();
   return c.json({ ok: true, secretId });
 });
 

@@ -88,7 +88,10 @@ export async function sendApprovalMessage(
     throw new Error(`Telegram sendMessage failed: ${resp.status} ${body}`);
   }
 
-  const result = (await resp.json()) as { ok: boolean; result: { message_id: number } };
+  const result = (await resp.json()) as {
+    ok: boolean;
+    result: { message_id: number };
+  };
   return { messageId: result.result.message_id };
 }
 

@@ -37,7 +37,9 @@ async function signJwt(
   payload: SessionPayload,
   secret: string,
 ): Promise<string> {
-  const header = base64url(new TextEncoder().encode(JSON.stringify({ alg: "HS256", typ: "JWT" })));
+  const header = base64url(
+    new TextEncoder().encode(JSON.stringify({ alg: "HS256", typ: "JWT" })),
+  );
   const body = base64url(new TextEncoder().encode(JSON.stringify(payload)));
   const data = `${header}.${body}`;
   const key = await hmacKey(secret);

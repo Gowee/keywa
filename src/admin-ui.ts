@@ -253,9 +253,8 @@ export function loginPage(): string {
 
 export function dashboardPage(timeoutSeconds: number = 900): string {
   const timeoutMin = Math.round(timeoutSeconds / 60);
-  const timeoutLabel = timeoutMin >= 60
-    ? Math.round(timeoutMin / 60) + 'h'
-    : timeoutMin + 'm';
+  const timeoutLabel =
+    timeoutMin >= 60 ? Math.round(timeoutMin / 60) + "h" : timeoutMin + "m";
   return `<!DOCTYPE html>
 <html lang="en">
 <head>

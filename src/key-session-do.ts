@@ -46,11 +46,7 @@ export class KeySessionDO extends DurableObject<Env> {
    * notification has expired. Re-requesting from the same IP refreshes the timeout.
    * Re-requesting from a different IP while pending throws (409 Conflict).
    */
-  async init(
-    secretId: string,
-    session: string,
-    ip: string,
-  ): Promise<Approval> {
+  async init(secretId: string, session: string, ip: string): Promise<Approval> {
     const existing = this.loadState();
     const timeoutMs = getTimeoutMs(this.env);
 
@@ -62,10 +58,7 @@ export class KeySessionDO extends DurableObject<Env> {
 
       // Already pending — reject duplicate request
       throw new Error("Request already pending");
-      if (
-        existing.notifiedAt &&
-        Date.now() - existing.notifiedAt < timeoutMs
-      ) {
+      if (existing.notifiedAt && Date.now() - existing.notifiedAt < timeoutMs) {
         const expiresAt = Date.now() + timeoutMs;
         this.saveState({ ...existing, expiresAt });
         await this.ctx.storage.setAlarm(expiresAt);
