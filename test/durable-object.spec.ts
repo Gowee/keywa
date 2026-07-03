@@ -20,7 +20,7 @@ describe("KeySessionDO", () => {
     expect(approval.expiresAt).toBeGreaterThan(Date.now());
   });
 
-  it("approve resolves a pending approval and cleans up", async () => {
+  it("approve resolves a pending approval", async () => {
     const stub = getStub("s2", "r1");
     const approval = await stub.init("s2", "r1", "127.0.0.1");
 
@@ -29,10 +29,10 @@ describe("KeySessionDO", () => {
     expect(result.approval).toBeTruthy();
     expect(result.approval!.status).toBe("approved");
 
-    // State is cleaned up — second approve finds nothing
+    // State is kept for disconnected clients — second approve reports already resolved
     const result2 = await stub.approve(approval.callbackNonce);
     expect(result2.ok).toBe(false);
-    expect(result2.error).toBe("Session not found");
+    expect(result2.error).toBe("Already approved");
   });
 
   it("approve rejects invalid nonce", async () => {
@@ -44,7 +44,7 @@ describe("KeySessionDO", () => {
     expect(result.error).toBe("Invalid nonce");
   });
 
-  it("deny resolves a pending approval and cleans up", async () => {
+  it("deny resolves a pending approval", async () => {
     const stub = getStub("s4", "r1");
     const approval = await stub.init("s4", "r1", "127.0.0.1");
 
@@ -53,10 +53,10 @@ describe("KeySessionDO", () => {
     expect(result.approval).toBeTruthy();
     expect(result.approval!.status).toBe("denied");
 
-    // State is cleaned up
+    // State is kept for disconnected clients — second deny reports already resolved
     const result2 = await stub.deny(approval.callbackNonce);
     expect(result2.ok).toBe(false);
-    expect(result2.error).toBe("Session not found");
+    expect(result2.error).toBe("Already denied");
   });
 
   it("alarm expires pending approvals and cleans up", async () => {
@@ -96,6 +96,33 @@ describe("KeySessionDO", () => {
     const result = await waitPromise;
     expect(result.status).toBe("denied");
   });
+
+  it("init returns resolved state after approval (disconnected client)", async () => {
+    const stub = getStub("s8", "r1");
+    const approval = await stub.init("s8", "r1", "127.0.0.1");
+
+    // Approve the request
+    await stub.approve(approval.callbackNonce);
+
+    // New init on the same DO should return the approved result
+    const recovered = await stub.init("s8", "r1", "127.0.0.1");
+    expect(recovered.status).toBe("approved");
+    expect(recovered.secretId).toBe("s8");
+  });
+
+  it("init cleans up abandoned pending and creates fresh request", async () => {
+    const stub = getStub("s9", "r1");
+    const first = await stub.init("s9", "r1", "1.1.1.1");
+    expect(first.status).toBe("pending");
+
+    // Simulate client disconnect: no wait() was called, so waitResolvers
+    // is empty. A new init() should clean up and create a fresh request.
+    const second = await stub.init("s9", "r1", "2.2.2.2");
+    expect(second.status).toBe("pending");
+    expect(second.ip).toBe("2.2.2.2");
+    expect(second.callbackNonce).not.toBe(first.callbackNonce);
+    expect(second.expiresAt).toBeGreaterThan(first.expiresAt);
+  }, 15000);
 
   // Note: duplicate pending requests throw "Request already pending",
   // but testing this via RPC causes unhandled rejection warnings in the CF test pool.

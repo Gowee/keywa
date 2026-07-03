@@ -12,14 +12,25 @@ import { randomNonce } from "./crypto";
  * is called, or when the alarm fires (timeout).
  *
  * Storage: a single KV key "state" containing the request state as JSON.
- * No secretValue is stored — the worker re-fetches from KV (SECRETS) after approval.
+ * No secretValue is stored — the worker re-fetches from D1 after approval.
  *
  * Lifecycle:
  *   init()    → store state, set alarm, notify Telegram
  *   wait()    → hold Promise in memory
- *   approve() → validate nonce, resolve wait(), delete state
- *   deny()    → validate nonce, resolve wait(), delete state
- *   alarm()   → update Telegram message (expired), resolve wait(), delete state
+ *   approve() → validate nonce, resolve wait()
+ *   deny()    → validate nonce, resolve wait()
+ *   alarm()   → clean up state and resolve pending waiters
+ *
+ * Duplicate-request policy:
+ *   - If there is an active listener (waitResolvers.length > 0), a new init()
+ *     is rejected with "Request already pending" to prevent multiple clients
+ *     from silently receiving the same secret on one approval.
+ *   - If the previous client disconnected (no listeners but state is still
+ *     pending), the abandoned request is cleaned up and a new request is
+ *     created with a fresh notification.
+ *   - If the request was already resolved (approved/denied), init() returns
+ *     the result immediately so a disconnected client can retrieve it. The
+ *     alarm handles final cleanup.
  */
 
 interface State {
@@ -42,39 +53,40 @@ export class KeySessionDO extends DurableObject<Env> {
 
   /**
    * Initialize or recover a session.
-   * Sends a Telegram notification if this is a fresh request or the previous
-   * notification has expired. Re-requesting from the same IP refreshes the timeout.
-   * Re-requesting from a different IP while pending throws (409 Conflict).
+   *
+   * Three cases when a previous state exists:
+   *  1. Already resolved (approved/denied) → return result immediately.
+   *     Allows a disconnected client to retrieve a just-approved secret.
+   *  2. Pending with an active listener → reject (409).
+   *     Prevents multiple clients from silently receiving the same secret.
+   *  3. Pending with no listener (client disconnected) → clean up the
+   *     abandoned request and create a new one with a fresh notification.
    */
   async init(secretId: string, session: string, ip: string): Promise<Approval> {
     const existing = this.loadState();
-    const timeoutMs = getTimeoutMs(this.env);
 
     if (existing) {
-      // Already resolved — return immediately
+      // Case 1: Already resolved — return immediately so a disconnected
+      // client can retrieve a just-approved secret.
       if (existing.status !== "pending") {
         return this.toApproval(existing);
       }
 
-      // Already pending — reject duplicate request
-      throw new Error("Request already pending");
-      if (existing.notifiedAt && Date.now() - existing.notifiedAt < timeoutMs) {
-        const expiresAt = Date.now() + timeoutMs;
-        this.saveState({ ...existing, expiresAt });
-        await this.ctx.storage.setAlarm(expiresAt);
-        return this.toApproval({ ...existing, expiresAt });
+      // Case 2: Pending with an active listener — reject to prevent
+      // multiple clients from silently receiving the same secret on one
+      // approval.
+      if (this.waitResolvers.length > 0) {
+        throw new Error("Request already pending");
       }
 
-      // Pending but notification expired — re-notify and refresh alarm
-      const expiresAt = Date.now() + timeoutMs;
-      const refreshed = { ...existing, expiresAt, notifiedAt: Date.now() };
-      this.saveState(refreshed);
-      await this.ctx.storage.setAlarm(expiresAt);
-      await this.notify(refreshed);
-      return this.toApproval(this.loadState()!);
+      // Case 3: Pending but no listener (client disconnected) — the
+      // previous request is abandoned. Clean up and fall through to
+      // create a fresh request with a new notification.
+      await this.ctx.storage.deleteAll();
     }
 
-    // New request
+    // New request (or fresh request after cleaning up an abandoned one)
+    const timeoutMs = getTimeoutMs(this.env);
     const callbackNonce = randomNonce();
     const now = Date.now();
     const expiresAt = now + timeoutMs;
@@ -100,7 +112,8 @@ export class KeySessionDO extends DurableObject<Env> {
 
   /**
    * Approve a pending request. Validates the callback nonce.
-   * Resolves the waiting wait() Promise and cleans up KV state.
+   * Resolves the waiting wait() Promises. State is kept so a disconnected
+   * client can retrieve the result via init(); the alarm handles cleanup.
    */
   async approve(
     callbackNonce: string,
@@ -114,14 +127,15 @@ export class KeySessionDO extends DurableObject<Env> {
 
     state.status = "approved";
     this.saveState(state);
-    const approval = this.resolveWait();
+    const approval = this.resolveWaiters(this.toApproval(state));
 
     return { ok: true, approval };
   }
 
   /**
    * Deny a pending request. Validates the callback nonce.
-   * Resolves the waiting wait() Promise and cleans up KV state.
+   * Resolves the waiting wait() Promises. State is kept so a disconnected
+   * client can retrieve the result via init(); the alarm handles cleanup.
    */
   async deny(
     callbackNonce: string,
@@ -135,7 +149,7 @@ export class KeySessionDO extends DurableObject<Env> {
 
     state.status = "denied";
     this.saveState(state);
-    const approval = this.resolveWait();
+    const approval = this.resolveWaiters(this.toApproval(state));
 
     return { ok: true, approval };
   }
@@ -157,42 +171,47 @@ export class KeySessionDO extends DurableObject<Env> {
 
   /**
    * Alarm handler — fires on timeout.
-   * Updates Telegram message to show expiration, resolves wait(), cleans up.
+   *
+   * If the request is still pending, marks it as expired and notifies
+   * Telegram. If already resolved (approved/denied), just cleans up.
+   * Always deletes all DO storage via deleteAll().
    */
   async alarm(): Promise<void> {
     const state = this.loadState();
-    if (!state) return;
+    if (!state) {
+      // No state (already cleaned up) — nothing to do
+      return;
+    }
 
-    // Best-effort: update Telegram message to show expired
-    if (state.chatId != null && state.messageId != null) {
-      try {
-        await updateApprovalMessage(
-          this.env.TELEGRAM_BOT_TOKEN,
-          state.chatId,
-          state.messageId,
-          state.secretId,
-          state.session,
-          state.ip,
-          "expired",
-          state.expiresAt,
-        );
-      } catch {
-        // Best-effort — ignore errors
+    if (state.status === "pending") {
+      // Still pending — mark as expired and update Telegram
+      if (state.chatId != null && state.messageId != null) {
+        try {
+          await updateApprovalMessage(
+            this.env.TELEGRAM_BOT_TOKEN,
+            state.chatId,
+            state.messageId,
+            state.secretId,
+            state.session,
+            state.ip,
+            "expired",
+            state.expiresAt,
+          );
+        } catch {
+          // Best-effort — ignore errors
+        }
       }
-    }
 
-    // Resolve all pending wait() with expired status, then clean up
-    const approval: Approval = {
-      ...state,
-      status: "expired",
-      expiresAt: state.expiresAt,
-    };
-    this.ctx.storage.kv.delete(STATE_KEY);
-
-    for (const resolve of this.waitResolvers) {
-      resolve(approval);
+      const approval: Approval = {
+        ...this.toApproval(state),
+        status: "expired",
+      };
+      await this.ctx.storage.deleteAll();
+      this.resolveWaiters(approval);
+    } else {
+      // Already resolved (approved/denied) — just clean up storage
+      await this.ctx.storage.deleteAll();
     }
-    this.waitResolvers = [];
   }
 
   // --- Private helpers ---
@@ -222,12 +241,8 @@ export class KeySessionDO extends DurableObject<Env> {
     };
   }
 
-  /** Resolve all pending wait() Promises and clean up KV state. */
-  private resolveWait(): Approval {
-    const state = this.loadState()!;
-    const approval = this.toApproval(state);
-    this.ctx.storage.kv.delete(STATE_KEY);
-
+  /** Resolve all pending wait() Promises with the given approval. */
+  private resolveWaiters(approval: Approval): Approval {
     for (const resolve of this.waitResolvers) {
       resolve(approval);
     }

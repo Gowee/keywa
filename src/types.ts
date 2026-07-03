@@ -35,7 +35,8 @@ export interface Approval {
 
 /** Get the timeout in milliseconds from env, defaulting to 900s (15 min). */
 export function getTimeoutMs(env: { TIMEOUT_SECONDS?: string }): number {
-  return (parseInt(env.TIMEOUT_SECONDS || "", 10) || 900) * 1000;
+  const parsed = parseInt(env.TIMEOUT_SECONDS || "", 10);
+  return (Number.isFinite(parsed) && parsed > 0 ? parsed : 900) * 1000;
 }
 
 export const DEFAULT_SESSION = "default";

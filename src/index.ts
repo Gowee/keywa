@@ -111,7 +111,7 @@ async function handleSecretRequest(
     case "denied":
       return c.text("Denied", 403);
     case "expired":
-      return c.text("Timeout", 408);
+      return c.text("Request expired", 410);
     default:
       return c.text("Unknown status", 500);
   }
