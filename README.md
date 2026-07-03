@@ -12,10 +12,11 @@ curl GET /secret/mysecret?token=credential → blocks → Telegram notification 
 ```
 
 1. Client (`curl`) requests a secret by ID, providing a per-secret access token
-2. keywa sends a Telegram notification with inline Approve/Deny buttons
-3. `curl` blocks (HTTP long-polling) until the admin acts
-4. Admin clicks Approve → secret is returned to `curl`
-5. Or: admin clicks Deny → `curl` gets 403, or timeout (default 15 min) → 408
+2. keywa checks IP allowlist (if configured) and token (if configured)
+3. keywa sends a Telegram notification with inline Approve/Deny buttons
+4. `curl` blocks (HTTP long-polling) until the admin acts
+5. Admin clicks Approve → secret is returned to `curl`
+6. Or: admin clicks Deny → `curl` gets 403, or timeout (default 15 min) → 408
 
 See [docs/architecture.md](docs/architecture.md) for design decisions and why Durable Objects over KV polling.
 
@@ -83,17 +84,23 @@ curl -X POST https://keywa.example.org/admin/webhook \
 ### Manage Secrets
 
 ```bash
-# Add a secret (value + per-secret access token)
+# Add a secret (value + per-secret access token + IP allowlist)
 curl -X PUT https://keywa.example.org/admin/api/secrets/mysecret \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"secret": "luks-passphrase", "token": "per-secret-credential"}'
+  -d '{"secret": "luks-passphrase", "token": "per-secret-credential", "cidrs": "203.0.113.0/24"}'
 
-# Update just the value (keep existing token)
+# Update just the value (keep existing token and IPs)
 curl -X PUT https://keywa.example.org/admin/api/secrets/mysecret \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"secret": "new-passphrase"}'
+
+# Clear IP restriction (empty string = clear)
+curl -X PUT https://keywa.example.org/admin/api/secrets/mysecret \
+  -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"cidrs": ""}'
 
 # Delete a secret
 curl -X DELETE https://keywa.example.org/admin/api/secrets/mysecret \
@@ -177,7 +184,7 @@ All admin endpoints accept either `Authorization: Bearer $ADMIN_TOKEN` or a sess
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/admin/api/secrets` | List secrets (JSON) |
-| PUT | `/admin/api/secrets/:secretId` | Add/update secret (`{secret, token}` body) |
+| PUT | `/admin/api/secrets/:secretId` | Add/update secret (`{secret, token, cidrs}` body) |
 | DELETE | `/admin/api/secrets/:secretId` | Delete secret |
 | POST | `/admin/webhook` | Register Telegram webhook |
 

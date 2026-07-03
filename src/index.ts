@@ -12,6 +12,12 @@ import { createSession, verifySession, destroySession } from "./telegram-auth";
 import { loginPage, dashboardPage } from "./admin-ui";
 import { KeySessionDO } from "./key-session-do";
 import { doName } from "./crypto";
+import {
+  parseClientIp,
+  parseCidrs,
+  ipMatchesCidrs,
+  normalizeCidrs,
+} from "./cidr";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -29,7 +35,7 @@ function rejectNullByte(value: string, label: string): string | null {
 async function initDB(db: D1Database): Promise<void> {
   await db
     .prepare(
-      "CREATE TABLE IF NOT EXISTS secrets (id TEXT PRIMARY KEY, secret TEXT NOT NULL, token TEXT NOT NULL, updated_at INTEGER NOT NULL)",
+      "CREATE TABLE IF NOT EXISTS secrets (id TEXT PRIMARY KEY, secret TEXT NOT NULL, token TEXT NOT NULL, cidrs TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL)",
     )
     .run();
 }
@@ -47,10 +53,11 @@ async function handleSecretRequest(
   const session = c.req.query("session") || DEFAULT_SESSION;
   const secretToken =
     c.req.query("token") ?? extractBearerToken(c.req.header("Authorization"));
-  const ip =
+  const rawIp =
     c.req.header("CF-Connecting-IP") ??
     c.req.header("X-Forwarded-For") ??
     "unknown";
+  const clientIp = parseClientIp(rawIp) ?? rawIp;
 
   if (!secretId) return c.text("secretId required", 400);
   if (secretId.length > LIMITS.secretId)
@@ -60,22 +67,38 @@ async function handleSecretRequest(
   const nullErr =
     rejectNullByte(secretId, "secretId") || rejectNullByte(session, "session");
   if (nullErr) return c.text(nullErr, 400);
-  if (!secretToken)
-    return c.text("token required (query param or Bearer header)", 401);
 
-  // Validate secret exists and token matches (before blocking on DO)
+  // Validate secret exists and check auth (CIDR + token)
   const row = await c.env.DB.prepare(
-    "SELECT secret, token FROM secrets WHERE id = ?",
+    "SELECT secret, token, cidrs FROM secrets WHERE id = ?",
   )
     .bind(secretId)
     .first<SecretRow>();
   if (!row) return c.text("Secret not found", 404);
-  if (row.token !== secretToken) return c.text("Invalid token", 403);
+
+  // CIDR check: skip if no CIDRs configured
+  if (row.cidrs) {
+    if (clientIp === "unknown")
+      return c.text("Unable to determine client IP", 500);
+    const parsed = parseCidrs(row.cidrs);
+    if (!parsed.ok) return c.text(parsed.error, 500);
+    if (!ipMatchesCidrs(clientIp, parsed.cidrs))
+      return c.text("IP not allowed", 403);
+  }
+
+  // Token check: skip if no token configured; require if set.
+  // Note: 401 (not 404) when token is required but missing — this intentionally
+  // leaks that the secret exists, since the Telegram approval flow is the real gate.
+  if (row.token) {
+    if (!secretToken)
+      return c.text("token required (query param or Bearer header)", 401);
+    if (row.token !== secretToken) return c.text("Invalid token", 403);
+  }
 
   // Rate limit: 10 requests per 60s per secretId+IP
   if (c.env.KEY_REQUEST_RATE_LIMIT) {
     const { success } = await c.env.KEY_REQUEST_RATE_LIMIT.limit({
-      key: secretId + ":" + ip,
+      key: secretId + ":" + clientIp,
     });
     if (!success) return c.text("Too many requests", 429);
   }
@@ -88,7 +111,7 @@ async function handleSecretRequest(
   ) as DurableObjectStub<KeySessionDO>;
 
   try {
-    await stub.init(secretId, session, ip);
+    await stub.init(secretId, session, clientIp);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("already pending"))
@@ -347,13 +370,13 @@ app.get("/admin/api/secrets", async (c) => {
   if (!(await isAdmin(c))) return c.text("Unauthorized", 401);
 
   const { results } = await c.env.DB.prepare(
-    "SELECT id, token, updated_at FROM secrets ORDER BY updated_at DESC",
-  ).all<{ id: string; token: string; updated_at: number }>();
+    "SELECT id, token, cidrs, updated_at FROM secrets ORDER BY updated_at DESC",
+  ).all<{ id: string; token: string; cidrs: string; updated_at: number }>();
 
   return c.json(results ?? []);
 });
 
-const LIMITS = { secretId: 128, session: 128, token: 128, value: 65536 };
+const LIMITS = { secretId: 128, session: 128, token: 128, cidrs: 512, value: 65536 };
 
 app.put("/admin/api/secrets/:secretId", async (c) => {
   if (!(await isAdmin(c))) return c.text("Unauthorized", 401);
@@ -363,34 +386,52 @@ app.put("/admin/api/secrets/:secretId", async (c) => {
   if (secretId.length > LIMITS.secretId)
     return c.text(`secretId too long (max ${LIMITS.secretId})`, 400);
 
-  const body = await c.req.json<{ secret?: string; token?: string }>();
+  const body = await c.req.json<{
+    secret?: string;
+    token?: string;
+    cidrs?: string;
+  }>();
 
-  if (body.token === undefined && body.secret === undefined)
-    return c.text("at least one of token or secret required", 400);
+  if (
+    body.token === undefined &&
+    body.secret === undefined &&
+    body.cidrs === undefined
+  )
+    return c.text("at least one of token, secret, or cidrs required", 400);
   if (body.token !== undefined && body.token.length > LIMITS.token)
     return c.text(`token too long (max ${LIMITS.token})`, 400);
   if (body.secret !== undefined && body.secret.length > LIMITS.value)
     return c.text(`secret too long (max ${LIMITS.value})`, 400);
+  if (body.cidrs !== undefined && body.cidrs.length > LIMITS.cidrs)
+    return c.text(`cidrs too long (max ${LIMITS.cidrs})`, 400);
+  if (body.cidrs) {
+    const parsed = parseCidrs(body.cidrs);
+    if (!parsed.ok) return c.text(parsed.error, 400);
+  }
 
   // Fetch existing row for partial updates
   const existing = await c.env.DB.prepare(
-    "SELECT secret, token FROM secrets WHERE id = ?",
+    "SELECT secret, token, cidrs FROM secrets WHERE id = ?",
   )
     .bind(secretId)
-    .first<{ secret: string; token: string }>();
+    .first<{ secret: string; token: string; cidrs: string }>();
 
   if (!existing && body.secret === undefined)
     return c.text("Secret not found — provide a value to create", 404);
   if (!existing && body.token === undefined)
     return c.text("Secret not found — provide a token to create", 404);
 
-  const secretValue = body.secret ?? existing!.secret;
-  const tokenValue = body.token ?? existing!.token;
+  const secretValue = body.secret ?? existing?.secret;
+  const tokenValue = body.token ?? existing?.token ?? "";
+  const cidrsValue = normalizeCidrs(body.cidrs ?? existing?.cidrs ?? "");
+
+  if (!secretValue)
+    return c.text("Secret not found — provide a value to create", 404);
 
   await c.env.DB.prepare(
-    "INSERT OR REPLACE INTO secrets (id, secret, token, updated_at) VALUES (?, ?, ?, ?)",
+    "INSERT OR REPLACE INTO secrets (id, secret, token, cidrs, updated_at) VALUES (?, ?, ?, ?, ?)",
   )
-    .bind(secretId, secretValue, tokenValue, Date.now())
+    .bind(secretId, secretValue, tokenValue, cidrsValue, Date.now())
     .run();
 
   return c.json({ ok: true, secretId });

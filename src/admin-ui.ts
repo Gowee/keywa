@@ -49,15 +49,15 @@ th { color: var(--text-muted); font-weight: 500; font-size: 0.8rem; text-transfo
 .btn-primary:hover { background: var(--green-bg-hover); }
 .btn-secondary { background: var(--btn-bg); color: var(--text); border: 1px solid var(--border); }
 .btn-secondary:hover { background: var(--btn-hover); }
-.form-row { display: flex; gap: 0.75rem; align-items: end; margin-bottom: 0.75rem; flex-wrap: wrap; }
+.form-row { display: flex; gap: 0.75rem; align-items: end; margin-bottom: 0.5rem; flex-wrap: wrap; }
 .form-row label { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.85rem; color: var(--text-muted); flex: 1; min-width: 0; }
 .form-row input, .form-row textarea { background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 0.5rem; color: var(--text); font-size: 0.9rem; font-family: inherit; min-width: 0; }
 .form-row input:focus, .form-row textarea:focus { border-color: var(--accent); outline: none; }
 .form-row textarea { resize: vertical; min-height: 2.5rem; }
-.input-with-btn { display: flex; gap: 0.3rem; }
-.input-with-btn input { flex: 1; }
-.input-with-btn .btn-inline { padding: 0.5rem 0.6rem; font-size: 0.75rem; white-space: nowrap; }
-.char-count { font-size: 0.75rem; color: var(--text-muted); text-align: right; margin-top: 0.2rem; }
+.input-with-btn { display: flex; }
+.input-with-btn input { flex: 1; border-radius: 4px 0 0 4px; }
+.input-with-btn .btn-inline { padding: 0.5rem 0.6rem; font-size: 0.75rem; white-space: nowrap; border-radius: 0 4px 4px 0; border-left: 0; }
+.char-count { font-size: 0.75rem; color: var(--text-muted); text-align: right; margin-top: 0.1rem; }
 .empty { padding: 2rem; text-align: center; color: var(--text-muted); }
 .toast { position: fixed; bottom: 1rem; right: 1rem; background: var(--toast-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem 1rem; font-size: 0.85rem; z-index: 100; transition: opacity 0.3s; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
 .toast.error { border-color: var(--red); }
@@ -89,6 +89,7 @@ function initThemeBtn() {
 const LIMITS = {
   secretId: 128,
   token: 128,
+  cidrs: 512,
   value: 65536,
 };
 
@@ -283,8 +284,8 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
       </div>
       <div style="overflow-x:auto">
       <table>
-        <thead><tr><th>ID</th><th>Token</th><th>Updated</th><th>Actions</th></tr></thead>
-        <tbody id="secret-list"><tr><td colspan="4" class="empty">Loading...</td></tr></tbody>
+        <thead><tr><th title="Unique secret identifier">ID</th><th title="Per-secret access token (masked)">Token</th><th title="Allowed IPs or CIDRs (empty = any)">IPs</th><th title="Last modified">Updated</th><th>Actions</th></tr></thead>
+        <tbody id="secret-list"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
       </table>
       </div>
     </div>
@@ -298,10 +299,16 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
           </label>
           <label>Token
             <div class="input-with-btn">
-              <input id="f-token" placeholder="leave empty to keep existing" title="per-secret access token" maxlength="${LIMITS.token}">
+              <input id="f-token" placeholder="empty = no token auth" title="per-secret access token; empty = clear" maxlength="${LIMITS.token}">
               <button class="btn btn-secondary btn-inline" onclick="generateToken()" title="Generate random token">🎲</button>
             </div>
             <div class="char-count"><span id="f-token-count">0</span>/${LIMITS.token}</div>
+          </label>
+        </div>
+        <div class="form-row" style="margin-bottom: 0.4rem">
+          <label>IPs
+            <input id="f-cidrs" placeholder="e.g. 192.168.1.0/24, 10.0.0.1" title="comma-separated IPs or CIDRs; empty = no IP restriction" maxlength="${LIMITS.cidrs}">
+            <div class="char-count"><span id="f-cidrs-count">0</span>/${LIMITS.cidrs}</div>
           </label>
         </div>
         <div class="form-row">
@@ -323,7 +330,7 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
     const API = '/admin/api/secrets';
 
     // Character counters + curl example
-    ['f-id', 'f-token', 'f-value'].forEach(id => {
+    ['f-id', 'f-token', 'f-cidrs', 'f-value'].forEach(id => {
       const el = document.getElementById(id);
       const counter = document.getElementById(id + '-count');
       if (el && counter) {
@@ -335,9 +342,10 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
       const id = document.getElementById('f-id').value.trim();
       const token = document.getElementById('f-token').value.trim();
       const pre = document.getElementById('curl-example');
-      if (id && token) {
+      if (id) {
         const origin = window.location.origin;
-        pre.textContent = "curl -H 'Authorization: Bearer " + token + "' " + origin + "/secret/" + encodeURIComponent(id);
+        const auth = token ? " -H 'Authorization: Bearer " + token + "'" : "";
+        pre.textContent = "curl --retry 3 --max-time ${timeoutSeconds} -fsS" + auth + " " + origin + "/secret/" + encodeURIComponent(id);
         pre.style.display = 'block';
       } else {
         pre.style.display = 'none';
@@ -360,23 +368,29 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
       );
     }
 
+    let secretsCache = [];
+
     function renderSecrets(secrets) {
+      secretsCache = secrets;
       const tbody = document.getElementById('secret-list');
       const count = document.getElementById('secret-count');
       count.textContent = secrets.length ? '(' + secrets.length + ')' : '';
 
       if (!secrets.length) {
-        tbody.innerHTML = '<tr><td colspan="4" class="empty">No secrets</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="5" class="empty">No secrets</td></tr>';
         return;
       }
 
       tbody.innerHTML = secrets.map(s => {
         const tok = s.token || '';
         const masked = tok.length >= 8 ? tok.slice(0,4) + '****' + tok.slice(-4) : tok ? '****' : '(none)';
+        const cidrs = s.cidrs || '';
+        const cidrsDisplay = cidrs.length > 30 ? cidrs.slice(0, 30) + '…' : cidrs || '(any)';
         const updated = s.updated_at ? timeAgo(s.updated_at) : '—';
         return '<tr>' +
           '<td class="mono">' + esc(s.id) + '</td>' +
           '<td class="mono">' + esc(masked) + '</td>' +
+          '<td class="mono muted" title="' + escAttr(cidrs) + '">' + esc(cidrsDisplay) + '</td>' +
           '<td class="muted">' + esc(updated) + '</td>' +
           '<td class="actions">' +
             '<button onclick="editSecret(this.dataset.id)" data-id="' + escAttr(s.id) + '">Edit</button> ' +
@@ -410,13 +424,16 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
       const id = document.getElementById('f-id').value.trim();
       const secret = document.getElementById('f-value').value;
       const token = document.getElementById('f-token').value.trim();
+      const cidrs = document.getElementById('f-cidrs').value.trim();
       if (!id) { toast('Secret ID required', true); return; }
-      if (!token && !secret) { toast('Provide token or value', true); return; }
+      if (!token && !secret && !cidrs) { toast('Provide token, value, or CIDRs', true); return; }
       if (id.length > ${LIMITS.secretId}) { toast('Secret ID too long (max ${LIMITS.secretId})', true); return; }
-      if (token && token.length > ${LIMITS.token}) { toast('Token too long (max ${LIMITS.token})', true); return; }
+      if (token.length > ${LIMITS.token}) { toast('Token too long (max ${LIMITS.token})', true); return; }
       if (secret && secret.length > ${LIMITS.value}) { toast('Value too long (max ${LIMITS.value})', true); return; }
-      const body = {};
-      if (token) body.token = token;
+      if (cidrs.length > ${LIMITS.cidrs}) { toast('CIDRs too long (max ${LIMITS.cidrs})', true); return; }
+      // Always send token and cidrs — empty means "clear this field".
+      // Omit secret when empty to preserve existing value (API: undefined = keep).
+      const body = { token, cidrs };
       if (secret) body.secret = secret;
       try {
         const resp = await fetch(API + '/' + encodeURIComponent(id), {
@@ -446,7 +463,12 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
     }
 
     function editSecret(id) {
+      const s = secretsCache.find(s => s.id === id);
       document.getElementById('f-id').value = id;
+      if (s) {
+        document.getElementById('f-token').value = s.token || '';
+        document.getElementById('f-cidrs').value = s.cidrs || '';
+      }
       document.getElementById('form-title').textContent = 'Edit Secret';
       document.getElementById('f-token').focus();
       updateCounters();
@@ -457,6 +479,7 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
       document.getElementById('f-id').value = '';
       document.getElementById('f-value').value = '';
       document.getElementById('f-token').value = '';
+      document.getElementById('f-cidrs').value = '';
       document.getElementById('form-title').textContent = 'Add Secret';
       updateCounters();
       updateCurlExample();

@@ -12,7 +12,8 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "hono": "^4.7.0"
+    "hono": "^4.7.0",
+    "ipaddr.js": "^2.4.0"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.16.20",

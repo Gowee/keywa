@@ -16,6 +16,7 @@ export interface SecretRow {
   id: string;
   secret: string;
   token: string;
+  cidrs: string;
   updated_at: number;
 }
 

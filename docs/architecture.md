@@ -34,9 +34,14 @@ CREATE TABLE IF NOT EXISTS secrets (
   id         TEXT PRIMARY KEY,
   secret     TEXT NOT NULL,
   token      TEXT NOT NULL,
+  cidrs      TEXT NOT NULL DEFAULT '',
   updated_at INTEGER NOT NULL
 );
 ```
+
+- `token`: per-secret access token. Empty = no token auth required.
+- `cidrs`: comma-separated IPs/CIDRs. Empty = no IP restriction.
+- Both are independently skippable: empty means "skip this check".
 
 D1 provides strongly consistent reads — no eventual consistency delay for the admin dashboard.
 
@@ -156,6 +161,8 @@ On approval/denial, the message is updated to show the result. On expiration (al
 
 ## Authentication
 
+### Admin API
+
 | | ADMIN_TOKEN | Telegram Login |
 |---|---|---|
 | **Who** | Machines / scripts | Humans |
@@ -170,11 +177,29 @@ Both methods authenticate the same admin API endpoints:
 
 Telegram login can be disabled via `DISABLE_TELEGRAM_LOGIN = "true"` env var. The web admin always accepts `ADMIN_TOKEN` as a fallback.
 
+### Secret Retrieval
+
+Each secret has two independent auth mechanisms. Empty = skip that check.
+
+| | Token | IP (CIDRs) |
+|---|---|---|
+| **What** | Per-secret access token | Comma-separated IPs/CIDRs |
+| **How** | `?token=` query param or `Bearer` header | Client IP from `CF-Connecting-IP` |
+| **Empty means** | No token required | No IP restriction |
+| **Canonicalization** | — | IPv4-mapped IPv6 → IPv4; plain IPs treated as /32 or /128 |
+
+Auth flow for `GET /secret/:id`:
+1. CIDR check — skip if empty; reject if IP not in allowlist
+2. Token check — skip if empty; reject if token doesn't match
+3. Both empty → open access (Telegram approval is still required)
+
+Plain IPs are stored without the `/32` or `/128` suffix (normalized on write).
+
 ## Threat Model
 
 | Attack | Mitigation |
 |--------|-----------|
-| Attacker discovers a key ID | Per-key token required |
+| Attacker discovers a key ID | Per-key token and/or IP allowlist (both optional, independently skippable) |
 | Attacker replays a request | 128-bit `callbackNonce`; expired requests auto-deny and clean up |
 | Attacker forges a Telegram callback | 128-bit random nonce; webhook secret optional defense-in-depth |
 | Attacker brute-forces the key token | Rate limiting: 10 req/60s per secretId+IP (Rate Limit API) |
@@ -189,7 +214,9 @@ Telegram login can be disabled via `DISABLE_TELEGRAM_LOGIN = "true"` env var. Th
 
 ```
 Client → GET /secret/:secretId?token=KEY_TOKEN
-  → Worker validates token against D1
+  → Worker fetches secret row from D1 (token + cidrs)
+  → Worker checks CIDR allowlist (skip if empty; 500 if IP unknown)
+  → Worker validates token (skip if empty)
   → Worker computes doName = base64url(SHA-256(secretId + "\0" + session)[0:16])
   → Worker gets DO stub by hash name
   → DO.init(secretId, session, ip)
