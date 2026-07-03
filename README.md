@@ -16,7 +16,7 @@ curl GET /secret/mysecret?token=credential → blocks → Telegram notification 
 3. keywa sends a Telegram notification with inline Approve/Deny buttons
 4. `curl` blocks (HTTP long-polling) until the admin acts
 5. Admin clicks Approve → secret is returned to `curl`
-6. Or: admin clicks Deny → `curl` gets 403, or timeout (default 15 min) → 408
+6. Or: admin clicks Deny → `curl` gets 403, or timeout (default 1 hour) → 410
 
 See [docs/architecture.md](docs/architecture.md) for design decisions and why Durable Objects over KV polling.
 
@@ -60,7 +60,7 @@ In `wrangler.toml`:
 
 ```toml
 [vars]
-TIMEOUT_SECONDS = "900"                # approval timeout (default 15 min)
+TIMEOUT_SECONDS = "3600"               # approval timeout (default 1 hour)
 # DISABLE_TELEGRAM_LOGIN = "true"      # uncomment to disable Telegram login
 ```
 
@@ -84,7 +84,7 @@ curl -X POST https://keywa.example.org/admin/webhook \
 ### Manage Secrets
 
 ```bash
-# Add a secret (value + per-secret access token + IP allowlist)
+# Add a secret (value + per-secret access token and/or IP allowlist)
 curl -X PUT https://keywa.example.org/admin/api/secrets/mysecret \
   -H "Authorization: Bearer YOUR_ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
@@ -110,7 +110,7 @@ curl -X DELETE https://keywa.example.org/admin/api/secrets/mysecret \
 ### Retrieve a Secret (with Approval)
 
 ```bash
-# This blocks until approved, denied, or timed out (15 min)
+# This blocks until approved, denied, or timed out (default 1 hour)
 
 # Via query param
 curl "https://keywa.example.org/secret/mysecret?token=per-secret-credential"
@@ -142,12 +142,13 @@ The dashboard lets you list, add, edit, and delete secrets. Telegram login can b
 
 KEYSERVER="https://keywa.example.org"
 SECRET_ID="tyo2-luks"
-SECRET_AUTH="per-secret-credential"
+SECRET_TOKEN="per-secret-credential"
 DEVICE="/dev/vda2"
 
 echo "Fetching LUKS key..."
-SECRET=$(curl -sf --max-time 900 --retry 3 \
-  "$KEYSERVER/secret/$SECRET_ID?token=$SECRET_AUTH")
+SECRET=$(curl -fsSH "Authorization: Bearer $SECRET_TOKEN" \
+  --max-time 3600 --retry 3 \
+  "$KEYSERVER/secret/$SECRET_ID?session=boot")
 
 if [ -z "$SECRET" ]; then
   echo "Failed to fetch secret"
@@ -202,6 +203,12 @@ pnpm build       # type-check and build
 pnpm lint        # format check
 pnpm test        # run tests
 pnpm test:watch  # run tests in watch mode
+```
+
+### Export D1 Data
+
+```bash
+pnpm wrangler d1 export keywa --remote --output=backup.sql
 ```
 
 ## Architecture

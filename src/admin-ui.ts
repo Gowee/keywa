@@ -141,8 +141,8 @@ export function loginPage(): string {
       <div class="session-info">Session: <code id="session-id"></code></div>
       <button id="login-btn" class="btn btn-primary" onclick="startTelegramLogin()">Login with Telegram</button>
     </div>
+    <div id="login-divider" class="hidden"><div class="divider">or</div></div>
     <div id="login-token" class="hidden">
-      <div class="divider">or</div>
       <p>Enter admin token</p>
       <div class="token-input">
         <input id="token-input" type="password" placeholder="ADMIN_TOKEN" autocomplete="off">
@@ -162,7 +162,7 @@ export function loginPage(): string {
     <div id="status" class="status"></div>
   </div>
   <script>
-    const sessionId = 'login-' + crypto.randomUUID().slice(0, 8);
+    const sessionId = 'web-' + crypto.randomUUID().slice(0, 8);
 
     async function init() {
       try {
@@ -173,6 +173,7 @@ export function loginPage(): string {
         if (config.telegram && !config.telegramDisabled) {
           document.getElementById('login-telegram').classList.remove('hidden');
           document.getElementById('session-id').textContent = sessionId;
+          document.getElementById('login-divider').classList.remove('hidden');
         }
         document.getElementById('login-token').classList.remove('hidden');
         if (!config.telegram) {

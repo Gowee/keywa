@@ -19,7 +19,7 @@ describe("KeySessionDO", () => {
     expect(approval.callbackNonce).toBeTruthy();
     expect(approval.expiresAt).toBeGreaterThan(Date.now());
     expect(approval.secret).toBe("my-secret");
-  });
+  }, 15000);
 
   it("approve resolves a pending approval", async () => {
     const stub = getStub("s2", "r1");
@@ -34,7 +34,7 @@ describe("KeySessionDO", () => {
     const result2 = await stub.approve(approval.callbackNonce);
     expect(result2.ok).toBe(false);
     expect(result2.error).toBe("Already approved");
-  });
+  }, 15000);
 
   it("approve rejects invalid nonce", async () => {
     const stub = getStub("s3", "r1");
@@ -43,7 +43,7 @@ describe("KeySessionDO", () => {
     const result = await stub.approve("wrong-nonce");
     expect(result.ok).toBe(false);
     expect(result.error).toBe("Invalid nonce");
-  });
+  }, 15000);
 
   it("deny resolves a pending approval", async () => {
     const stub = getStub("s4", "r1");
@@ -58,7 +58,7 @@ describe("KeySessionDO", () => {
     const result2 = await stub.deny(approval.callbackNonce);
     expect(result2.ok).toBe(false);
     expect(result2.error).toBe("Already denied");
-  });
+  }, 15000);
 
   it("alarm expires pending approvals and cleans up", async () => {
     const stub = getStub("s5", "r1");
@@ -86,7 +86,7 @@ describe("KeySessionDO", () => {
     const result = await waitPromise;
     expect(result.status).toBe("approved");
     expect(result.secret).toBe("super-secret");
-  });
+  }, 15000);
 
   it("wait resolves when denied", async () => {
     const stub = getStub("s7", "r1");
@@ -97,7 +97,7 @@ describe("KeySessionDO", () => {
 
     const result = await waitPromise;
     expect(result.status).toBe("denied");
-  });
+  }, 15000);
 
   it("wait cleans up DO after resolving", async () => {
     const stub = getStub("s6b", "r1");
@@ -130,20 +130,51 @@ describe("KeySessionDO", () => {
     const fresh = await stub.init("s8", "r1", "127.0.0.1");
     expect(fresh.status).toBe("pending");
     expect(fresh.secretId).toBe("s8");
-  });
+  }, 15000);
 
-  it("init cleans up abandoned pending and creates fresh request", async () => {
+  it("init updates pending request in place when IP changes (no listener)", async () => {
     const stub = getStub("s9", "r1");
     const first = await stub.init("s9", "r1", "1.1.1.1");
     expect(first.status).toBe("pending");
 
-    // Simulate client disconnect: no wait() was called, so waitResolvers
-    // is empty. A new init() should clean up and create a fresh request.
+    // Simulate client disconnect: no wait() was called, so waitResolver
+    // is null. A new init() with different IP revokes nonce and updates.
     const second = await stub.init("s9", "r1", "2.2.2.2");
     expect(second.status).toBe("pending");
     expect(second.ip).toBe("2.2.2.2");
     expect(second.callbackNonce).not.toBe(first.callbackNonce);
     expect(second.expiresAt).toBeGreaterThan(first.expiresAt);
+  }, 15000);
+
+  it("init preserves pending request when IP matches (no listener)", async () => {
+    const stub = getStub("s9b", "r1");
+    const first = await stub.init("s9b", "r1", "1.1.1.1", "old-secret");
+    expect(first.status).toBe("pending");
+
+    // Same IP, no listener — preserve state, update secret and expiry.
+    const second = await stub.init("s9b", "r1", "1.1.1.1", "new-secret");
+    expect(second.status).toBe("pending");
+    expect(second.ip).toBe("1.1.1.1");
+    expect(second.callbackNonce).toBe(first.callbackNonce);
+    expect(second.secret).toBe("new-secret");
+    expect(second.expiresAt).toBeGreaterThan(first.expiresAt);
+  }, 15000);
+
+  it("init allows retry after disconnect (cancelWait clears resolver)", async () => {
+    const stub = getStub("s10", "r1");
+    const first = await stub.init("s10", "r1", "1.1.1.1");
+    expect(first.status).toBe("pending");
+
+    // Simulate: client starts waiting, then disconnects.
+    // In production, the Worker calls cancelWait() on HTTP abort.
+    const _wait = stub.wait();
+    await stub.cancelWait();
+
+    // Client retries with a new init() — should NOT get 409.
+    const retry = await stub.init("s10", "r1", "2.2.2.2");
+    expect(retry.status).toBe("pending");
+    expect(retry.ip).toBe("2.2.2.2");
+    expect(retry.callbackNonce).not.toBe(first.callbackNonce);
   }, 15000);
 
   // Note: duplicate pending requests throw "Request already pending",

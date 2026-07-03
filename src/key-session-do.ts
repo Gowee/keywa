@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Approval } from "./types";
 import { getTimeoutMs } from "./types";
-import { sendApprovalMessage, updateApprovalMessage } from "./telegram";
+import { sendApprovalMessage, updateApprovalMessage, refreshApprovalMessage } from "./telegram";
 import { randomNonce } from "./crypto";
 
 /**
@@ -15,19 +15,25 @@ import { randomNonce } from "./crypto";
  * including the secret value captured at init time.
  *
  * Lifecycle:
- *   init()    → store state, set alarm, notify Telegram; or return resolved result and clean up
- *   wait()    → hold Promise in memory; on resolve → clean up state, cancel alarm
- *   approve() → validate nonce, resolve wait()
- *   deny()    → validate nonce, resolve wait()
- *   alarm()   → clean up state and resolve pending waiters
+ *   init()      → store state, set alarm, notify Telegram; or return resolved result and clean up
+ *   wait()      → hold Promise in memory; on resolve → clean up state, cancel alarm
+ *   cancelWait() → clear stale resolver (called by Worker on client disconnect)
+ *   approve()   → validate nonce, resolve wait()
+ *   deny()      → validate nonce, resolve wait()
+ *   alarm()     → clean up state and resolve pending waiters
  *
  * Duplicate-request policy:
- *   - If there is an active listener (waitResolvers.length > 0), a new init()
+ *   - If there is an active listener (waitResolver !== null), a new init()
  *     is rejected with "Request already pending" to prevent multiple clients
  *     from silently receiving the same secret on one approval.
- *   - If the previous client disconnected (no listeners but state is still
- *     pending), the abandoned request is cleaned up and a new request is
- *     created with a fresh notification.
+ *   - The Worker calls cancelWait() when the client's HTTP connection drops
+ *     (abort signal), so a retrying client sees no active listener and gets
+ *     a fresh request instead of 409.
+ *   - If the previous client disconnected without cancelWait() (e.g. Worker
+ *     crash), the alarm eventually cleans up the stale state.
+ *   - Pending requests with no listener are preserved (not recreated).
+ *     If IP changed, the nonce is revoked and the Telegram message is
+ *     refreshed in-place. Same-IP retries silently reattach.
  *   - If the request was already resolved (approved/denied), init() returns
  *     the result immediately and cleans up the DO. Future requests to the
  *     same (secretId, session) trigger a fresh approval.
@@ -47,7 +53,9 @@ interface State {
   createdAt: number;
   notifiedAt: number | null;
   expiresAt: number;
+  /** Telegram chat ID. Null only before first notify() succeeds. */
   chatId: string | number | null;
+  /** Telegram message ID. Null only before first notify() succeeds. */
   messageId: number | null;
   /** Secret value captured at init time. Included in approval result. */
   secret?: string;
@@ -56,7 +64,7 @@ interface State {
 const STATE_KEY = "state";
 
 export class KeySessionDO extends DurableObject<Env> {
-  private waitResolvers: ((value: Approval) => void | Promise<void>)[] = [];
+  private waitResolver: ((value: Approval) => void | Promise<void>) | null = null;
 
   /**
    * Initialize or recover a session.
@@ -66,8 +74,9 @@ export class KeySessionDO extends DurableObject<Env> {
    *     Allows a disconnected client to retrieve a just-approved secret.
    *  2. Pending with an active listener → reject (409).
    *     Prevents multiple clients from silently receiving the same secret.
-   *  3. Pending with no listener (client disconnected) → clean up the
-   *     abandoned request and create a new one with a fresh notification.
+   *  3. Pending with no listener (client disconnected) → preserve state,
+   *     update expiry. If IP changed: revoke nonce, update IP, refresh
+   *     Telegram message in-place.
    */
   async init(secretId: string, session: string, ip: string, secret?: string): Promise<Approval> {
     const existing = this.loadState();
@@ -86,14 +95,62 @@ export class KeySessionDO extends DurableObject<Env> {
       // Case 2: Pending with an active listener — reject to prevent
       // multiple clients from silently receiving the same secret on one
       // approval.
-      if (this.waitResolvers.length > 0) {
+      if (this.waitResolver !== null) {
         throw new Error("Request already pending");
       }
 
-      // Case 3: Pending but no listener (client disconnected) — the
-      // previous request is abandoned. Clean up and fall through to
-      // create a fresh request with a new notification.
-      await this.ctx.storage.deleteAll();
+      // Case 3: Pending but no listener (client disconnected).
+      // Preserve the existing request; update expiry and optionally
+      // revoke the nonce if the IP changed.
+      const timeoutMs = getTimeoutMs(this.env);
+      const now = Date.now();
+      const expiresAt = now + timeoutMs;
+
+      if (existing.ip !== ip) {
+        // IP changed — revoke nonce, update IP, refresh Telegram message.
+        existing.callbackNonce = randomNonce();
+        existing.ip = ip;
+      }
+      existing.secret = secret;
+      existing.expiresAt = expiresAt;
+      this.saveState(existing);
+      await this.ctx.storage.setAlarm(expiresAt);
+
+      // Refresh the Telegram message (updated IP/nonce/expiry).
+      // If the message no longer exists or the edit fails, fall back to
+      // a fresh notification. If that also fails, clean up — there's no
+      // valid message for the admin to approve, so the client must not hang.
+      let notified = false;
+      if (existing.chatId && existing.messageId) {
+        try {
+          await refreshApprovalMessage(
+            this.env.TELEGRAM_BOT_TOKEN,
+            existing.chatId,
+            existing.messageId,
+            existing.secretId,
+            existing.session,
+            existing.ip,
+            existing.callbackNonce,
+            existing.expiresAt,
+          );
+          notified = true;
+        } catch {
+          // Message gone or edit failed — fall through to fresh notification.
+        }
+      }
+      if (!notified) {
+        try {
+          await this.notify(existing);
+        } catch {
+          // Fresh notification also failed. The state is still valid
+          // (alarm will clean up on expiry) and the old message may
+          // still exist (refresh failed for a transient reason).
+          // Log and continue — the client can retry.
+          console.error("Failed to send fresh notification in Case 3");
+        }
+      }
+
+      return this.toApproval(existing);
     }
 
     // New request (or fresh request after cleaning up an abandoned one)
@@ -117,7 +174,15 @@ export class KeySessionDO extends DurableObject<Env> {
 
     this.saveState(state);
     await this.ctx.storage.setAlarm(expiresAt);
-    await this.notify(state);
+    try {
+      await this.notify(state);
+    } catch (err) {
+      // Notification failed — clean up so the client gets an error
+      // instead of a pending request the admin never sees.
+      await this.ctx.storage.deleteAll();
+      await this.cancelAlarm();
+      throw err;
+    }
 
     return this.toApproval(this.loadState()!);
   }
@@ -177,12 +242,12 @@ export class KeySessionDO extends DurableObject<Env> {
     if (state.status !== "pending") return this.toApproval(state);
 
     return new Promise<Approval>((resolve) => {
-      this.waitResolvers.push(async (approval) => {
+      this.waitResolver = async (approval) => {
         // Clean up DO after client retrieves the result
         await this.ctx.storage.deleteAll();
         await this.cancelAlarm();
         resolve(approval);
-      });
+      };
     });
   }
 
@@ -261,10 +326,10 @@ export class KeySessionDO extends DurableObject<Env> {
 
   /** Resolve all pending wait() Promises with the given approval. */
   private async resolveWaiters(approval: Approval): Promise<Approval> {
-    for (const resolve of this.waitResolvers) {
-      await resolve(approval);
+    if (this.waitResolver) {
+      await this.waitResolver(approval);
+      this.waitResolver = null;
     }
-    this.waitResolvers = [];
     return approval;
   }
 
@@ -275,6 +340,15 @@ export class KeySessionDO extends DurableObject<Env> {
     } catch {
       // Alarm may not exist
     }
+  }
+
+  /**
+   * Cancel a pending wait() when the client disconnects.
+   * Clears the resolver so a subsequent init() sees no active listener
+   * and allows the client to retry.
+   */
+  cancelWait(): void {
+    this.waitResolver = null;
   }
 
   /** Send Telegram notification and store chatId/messageId in state. */
@@ -301,6 +375,7 @@ export class KeySessionDO extends DurableObject<Env> {
       }
     } catch (err) {
       console.error("Failed to send Telegram notification:", err);
+      throw err;
     }
   }
 }

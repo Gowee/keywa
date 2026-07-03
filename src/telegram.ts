@@ -135,6 +135,51 @@ export async function updateApprovalMessage(
   }
 }
 
+/**
+ * Update an existing approval message with refreshed IP, nonce, and expiry.
+ * Re-renders the message with new Approve/Deny buttons using the new nonce.
+ */
+export async function refreshApprovalMessage(
+  botToken: string,
+  chatId: string | number,
+  messageId: number,
+  secretId: string,
+  session: string,
+  ip: string,
+  callbackNonce: string,
+  expiresAt: number,
+): Promise<void> {
+  const name = await doName(secretId, session);
+  const approveData = buildCallbackData("a", name, callbackNonce);
+  const denyData = buildCallbackData("d", name, callbackNonce);
+
+  const text = formatRequestMessage(secretId, session, ip, expiresAt);
+
+  const resp = await fetch(`${TELEGRAM_API}${botToken}/editMessageText`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: "HTML",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ Approve", callback_data: approveData },
+            { text: "❌ Deny", callback_data: denyData },
+          ],
+        ],
+      },
+    }),
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Telegram editMessageText (refresh) failed: ${resp.status} ${body}`);
+  }
+}
+
 /** Answer a callback query to dismiss the loading spinner and show a toast. */
 export async function answerCallbackQuery(
   botToken: string,

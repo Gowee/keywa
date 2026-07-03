@@ -25,6 +25,9 @@ const app = new Hono<{ Bindings: Env }>();
 // Helpers
 // ---------------------------------------------------------------------------
 
+/** Reserved secretId used for web admin login approval. */
+const LOGIN_SECRET_ID = "__login__";
+
 /** Reject secretId or session containing null byte (delimiter for DO name hashing). */
 function rejectNullByte(value: string, label: string): string | null {
   if (value.includes("\0")) return `${label} must not contain null byte`;
@@ -119,6 +122,13 @@ async function handleSecretRequest(
       return c.text("Request already pending", 409);
     throw err;
   }
+
+  // If the client disconnects, cancel the pending wait so the resolver
+  // doesn't become stale. This allows a retrying client to get a fresh
+  // request instead of hitting "already pending".
+  const onAbort = () => { stub.cancelWait(); };
+  c.req.raw.signal.addEventListener("abort", onAbort);
+
   const approval = await stub.wait();
 
   switch (approval.status) {
@@ -307,8 +317,8 @@ app.post("/admin/auth/login", async (c) => {
     // Accept session name from client (for verification display) or generate one
     const body = await c.req.json<{ session?: string }>().catch(() => ({}));
     const nonce = crypto.randomUUID().slice(0, 8);
-    const secretId = `__auth__`;
-    let session = body.session || `login-${nonce}`;
+    const secretId = LOGIN_SECRET_ID;
+    let session = body.session || `web-${nonce}`;
     if (session.length > LIMITS.session)
       session = session.slice(0, LIMITS.session);
     if (session.includes("\0"))
@@ -321,6 +331,10 @@ app.post("/admin/auth/login", async (c) => {
     ) as DurableObjectStub<KeySessionDO>;
 
     await stub.init(secretId, session, ip);
+
+    const onAbort = () => { stub.cancelWait(); };
+    c.req.raw.signal.addEventListener("abort", onAbort);
+
     const approval = await stub.wait();
 
     if (approval.status === "approved") {
@@ -378,6 +392,8 @@ app.put("/admin/api/secrets/:secretId", async (c) => {
 
   const secretId = c.req.param("secretId");
   if (!secretId) return c.text("secretId required", 400);
+  if (secretId === LOGIN_SECRET_ID)
+    return c.text("secretId is reserved", 400);
   if (secretId.length > LIMITS.secretId)
     return c.text(`secretId too long (max ${LIMITS.secretId})`, 400);
 
