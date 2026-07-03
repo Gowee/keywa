@@ -32,12 +32,14 @@ export interface Approval {
   expiresAt: number;
   chatId: string | number | null;
   messageId: number | null;
+  /** The secret value at init time. Only present when approved. */
+  secret?: string;
 }
 
-/** Get the timeout in milliseconds from env, defaulting to 900s (15 min). */
+/** Get the timeout in milliseconds from env, defaulting to 3600s (1 hour). */
 export function getTimeoutMs(env: { TIMEOUT_SECONDS?: string }): number {
   const parsed = parseInt(env.TIMEOUT_SECONDS || "", 10);
-  return (Number.isFinite(parsed) && parsed > 0 ? parsed : 900) * 1000;
+  return (Number.isFinite(parsed) && parsed > 0 ? parsed : 3600) * 1000;
 }
 
 export const DEFAULT_SESSION = "default";

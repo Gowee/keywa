@@ -25,7 +25,7 @@ Cookie:          login session (signed, no persistence)
 
 No KV namespaces. All persistent storage is D1 or DO-local.
 
-The DO uses KV storage (`ctx.storage.kv`) with a single key `"state"`. The secret value is never stored in the DO — the worker re-fetches from D1 after approval.
+The DO uses KV storage (`ctx.storage.kv`) with a single key `"state"`, which includes the secret value captured at init time.
 
 ### D1 Schema
 
@@ -58,6 +58,7 @@ D1 provides strongly consistent reads — no eventual consistency delay for the 
 ```
 Worker                          Durable Object
   │                                │
+  ├─ stub.init(…, secret) ───────►│ stores state + secret value
   ├─ stub.wait() ────────────────►│
   │   (returns Promise)            │ stores resolver in memory
   │   (Worker awaits)              │ (idle, no CPU)
@@ -66,11 +67,10 @@ Worker                          Durable Object
   │                                │
   ├─ stub.approve(nonce) ────────►│
   │                                │ validates nonce, resolves Promise
-  │                                │ deletes state from KV
   │◄───────────────────────────────┤
   │   wait() resolved!             │
-  │   re-fetches secret from D1    │
-  │   returns key to curl          │
+  │   deletes state from KV        │
+  │   returns secret to curl       │
 ```
 
 ## Naming & Identifiers
@@ -133,14 +133,16 @@ The DO stores a single KV key `"state"` containing:
 | Phase | Action |
 |-------|--------|
 | `init()` | Store state, set alarm, notify Telegram (captures chatId/messageId) |
-| `wait()` | Hold Promise in memory (zero CPU) |
-| `approve(nonce)` | Validate nonce → set status → resolve wait() → delete state |
-| `deny(nonce)` | Validate nonce → set status → resolve wait() → delete state |
+| `wait()` | Hold Promise in memory (zero CPU); on resolve → delete state, cancel alarm |
+| `approve(nonce)` | Validate nonce → set status → resolve wait() |
+| `deny(nonce)` | Validate nonce → set status → resolve wait() |
 | `alarm()` | Update Telegram message (⏰ Expired) → resolve wait() → delete state |
+
+**State cleanup**: State is deleted when the result is retrieved (via `wait()` resolving or `init()` returning a resolved result). If the client never retrieves the result, the alarm cleans up on expiration. No state persists forever.
 
 **Re-request**: If `init()` is called for a pending (secretId, session), the timeout is refreshed (`setAlarm` replaces the existing alarm) and the Telegram notification is re-sent if expired.
 
-**No secretValue in DO**: The worker fetches the secret from D1 before calling `init()`. After `wait()` resolves as approved, the worker re-fetches from D1. The DO never stores the actual secret.
+**Secret stored in DO**: The worker passes the secret value to `init()`, which stores it in the DO state. This ensures the approved value is the one at request time, even if the D1 value changes later, and avoids a second D1 read after approval.
 
 ## Telegram Message
 
@@ -214,21 +216,21 @@ Plain IPs are stored without the `/32` or `/128` suffix (normalized on write).
 
 ```
 Client → GET /secret/:secretId?token=KEY_TOKEN
-  → Worker fetches secret row from D1 (token + cidrs)
+  → Worker fetches secret row from D1 (token + cidrs + secret)
   → Worker checks CIDR allowlist (skip if empty; 500 if IP unknown)
   → Worker validates token (skip if empty)
   → Worker computes doName = base64url(SHA-256(secretId + "\0" + session)[0:16])
   → Worker gets DO stub by hash name
-  → DO.init(secretId, session, ip)
-      → stores state in DO KV, sets alarm, sends Telegram notification
+  → DO.init(secretId, session, ip, secret)
+      → stores state + secret in DO KV, sets alarm, sends Telegram notification
   → DO.wait() → blocks (Promise held in memory)
   ... admin clicks Approve in Telegram ...
   → Telegram → POST /telegram/webhook
   → Worker parses callback_data: "{action}:{doName22}:{callbackNonce22}"
   → Worker gets DO stub by hash name (no lookup needed)
-  → DO.approve(callbackNonce) → validates, resolves wait(), deletes state
-  → Worker re-fetches secret from D1
-  → Worker returns secret to client
+  → DO.approve(callbackNonce) → validates, resolves wait()
+  → DO.wait() resolves → deletes state, cancels alarm
+  → Worker returns secret to client (from DO, no D1 re-read)
 ```
 
 ### Approval (Admin via Telegram)

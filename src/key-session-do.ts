@@ -11,12 +11,12 @@ import { randomNonce } from "./crypto";
  * The `wait()` method returns a Promise that resolves when `approve()` or `deny()`
  * is called, or when the alarm fires (timeout).
  *
- * Storage: a single KV key "state" containing the request state as JSON.
- * No secretValue is stored — the worker re-fetches from D1 after approval.
+ * Storage: a single KV key "state" containing the request state as JSON,
+ * including the secret value captured at init time.
  *
  * Lifecycle:
- *   init()    → store state, set alarm, notify Telegram
- *   wait()    → hold Promise in memory
+ *   init()    → store state, set alarm, notify Telegram; or return resolved result and clean up
+ *   wait()    → hold Promise in memory; on resolve → clean up state, cancel alarm
  *   approve() → validate nonce, resolve wait()
  *   deny()    → validate nonce, resolve wait()
  *   alarm()   → clean up state and resolve pending waiters
@@ -29,8 +29,13 @@ import { randomNonce } from "./crypto";
  *     pending), the abandoned request is cleaned up and a new request is
  *     created with a fresh notification.
  *   - If the request was already resolved (approved/denied), init() returns
- *     the result immediately so a disconnected client can retrieve it. The
- *     alarm handles final cleanup.
+ *     the result immediately and cleans up the DO. Future requests to the
+ *     same (secretId, session) trigger a fresh approval.
+ *
+ * State cleanup:
+ *   - On result retrieval: wait() or init() deletes state and cancels alarm.
+ *   - On expiration: alarm() deletes state (pending → expired; resolved → removed).
+ *   - No state persists forever.
  */
 
 interface State {
@@ -44,12 +49,14 @@ interface State {
   expiresAt: number;
   chatId: string | number | null;
   messageId: number | null;
+  /** Secret value captured at init time. Included in approval result. */
+  secret?: string;
 }
 
 const STATE_KEY = "state";
 
 export class KeySessionDO extends DurableObject<Env> {
-  private waitResolvers: ((value: Approval) => void)[] = [];
+  private waitResolvers: ((value: Approval) => void | Promise<void>)[] = [];
 
   /**
    * Initialize or recover a session.
@@ -62,14 +69,18 @@ export class KeySessionDO extends DurableObject<Env> {
    *  3. Pending with no listener (client disconnected) → clean up the
    *     abandoned request and create a new one with a fresh notification.
    */
-  async init(secretId: string, session: string, ip: string): Promise<Approval> {
+  async init(secretId: string, session: string, ip: string, secret?: string): Promise<Approval> {
     const existing = this.loadState();
 
     if (existing) {
       // Case 1: Already resolved — return immediately so a disconnected
-      // client can retrieve a just-approved secret.
+      // client can retrieve a just-approved secret. Then clean up so
+      // future requests trigger a fresh approval.
       if (existing.status !== "pending") {
-        return this.toApproval(existing);
+        const approval = this.toApproval(existing);
+        await this.ctx.storage.deleteAll();
+        await this.cancelAlarm();
+        return approval;
       }
 
       // Case 2: Pending with an active listener — reject to prevent
@@ -101,6 +112,7 @@ export class KeySessionDO extends DurableObject<Env> {
       expiresAt,
       chatId: null,
       messageId: null,
+      secret,
     };
 
     this.saveState(state);
@@ -112,8 +124,8 @@ export class KeySessionDO extends DurableObject<Env> {
 
   /**
    * Approve a pending request. Validates the callback nonce.
-   * Resolves the waiting wait() Promises. State is kept so a disconnected
-   * client can retrieve the result via init(); the alarm handles cleanup.
+   * Resolves the waiting wait() Promises. State persists until retrieved
+   * via wait() or init(); the alarm handles cleanup if never retrieved.
    */
   async approve(
     callbackNonce: string,
@@ -127,15 +139,15 @@ export class KeySessionDO extends DurableObject<Env> {
 
     state.status = "approved";
     this.saveState(state);
-    const approval = this.resolveWaiters(this.toApproval(state));
+    const approval = await this.resolveWaiters(this.toApproval(state));
 
     return { ok: true, approval };
   }
 
   /**
    * Deny a pending request. Validates the callback nonce.
-   * Resolves the waiting wait() Promises. State is kept so a disconnected
-   * client can retrieve the result via init(); the alarm handles cleanup.
+   * Resolves the waiting wait() Promises. State persists until retrieved
+   * via wait() or init(); the alarm handles cleanup if never retrieved.
    */
   async deny(
     callbackNonce: string,
@@ -149,7 +161,7 @@ export class KeySessionDO extends DurableObject<Env> {
 
     state.status = "denied";
     this.saveState(state);
-    const approval = this.resolveWaiters(this.toApproval(state));
+    const approval = await this.resolveWaiters(this.toApproval(state));
 
     return { ok: true, approval };
   }
@@ -165,7 +177,12 @@ export class KeySessionDO extends DurableObject<Env> {
     if (state.status !== "pending") return this.toApproval(state);
 
     return new Promise<Approval>((resolve) => {
-      this.waitResolvers.push(resolve);
+      this.waitResolvers.push(async (approval) => {
+        // Clean up DO after client retrieves the result
+        await this.ctx.storage.deleteAll();
+        await this.cancelAlarm();
+        resolve(approval);
+      });
     });
   }
 
@@ -207,7 +224,7 @@ export class KeySessionDO extends DurableObject<Env> {
         status: "expired",
       };
       await this.ctx.storage.deleteAll();
-      this.resolveWaiters(approval);
+      await this.resolveWaiters(approval);
     } else {
       // Already resolved (approved/denied) — just clean up storage
       await this.ctx.storage.deleteAll();
@@ -238,16 +255,26 @@ export class KeySessionDO extends DurableObject<Env> {
       expiresAt: state.expiresAt,
       chatId: state.chatId,
       messageId: state.messageId,
+      secret: state.secret,
     };
   }
 
   /** Resolve all pending wait() Promises with the given approval. */
-  private resolveWaiters(approval: Approval): Approval {
+  private async resolveWaiters(approval: Approval): Promise<Approval> {
     for (const resolve of this.waitResolvers) {
-      resolve(approval);
+      await resolve(approval);
     }
     this.waitResolvers = [];
     return approval;
+  }
+
+  /** Cancel the alarm if one is set (best-effort). */
+  private async cancelAlarm(): Promise<void> {
+    try {
+      await this.ctx.storage.deleteAlarm();
+    } catch {
+      // Alarm may not exist
+    }
   }
 
   /** Send Telegram notification and store chatId/messageId in state. */

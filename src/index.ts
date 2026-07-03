@@ -103,7 +103,8 @@ async function handleSecretRequest(
     if (!success) return c.text("Too many requests", 429);
   }
 
-  // DO does NOT store the secret — we re-fetch from D1 after approval
+  // DO stores the secret at init time so the approved value is the one
+  // that existed when the request was triggered, even if D1 changes later.
   const name = await doName(secretId, session);
   const doId = c.env.KEY_SESSION_DO.idFromName(name);
   const stub = c.env.KEY_SESSION_DO.get(
@@ -111,7 +112,7 @@ async function handleSecretRequest(
   ) as DurableObjectStub<KeySessionDO>;
 
   try {
-    await stub.init(secretId, session, clientIp);
+    await stub.init(secretId, session, clientIp, row.secret);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("already pending"))
@@ -122,14 +123,8 @@ async function handleSecretRequest(
 
   switch (approval.status) {
     case "approved": {
-      // Re-fetch secret from D1 (DO doesn't store it)
-      const fresh = await c.env.DB.prepare(
-        "SELECT secret FROM secrets WHERE id = ?",
-      )
-        .bind(secretId)
-        .first<{ secret: string }>();
-      if (!fresh) return c.text("Secret deleted", 410);
-      return c.text(fresh.secret);
+      if (!approval.secret) return c.text("Secret deleted", 410);
+      return c.text(approval.secret);
     }
     case "denied":
       return c.text("Denied", 403);

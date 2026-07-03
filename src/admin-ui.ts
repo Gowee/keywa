@@ -27,23 +27,28 @@ const THEME_CSS = `
 body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: var(--bg); color: var(--text); transition: background 0.2s, color 0.2s; }
 .header { background: var(--bg-card); border-bottom: 1px solid var(--border); padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; }
 .header h1 { font-size: 1.2rem; }
-.header-actions { display: flex; gap: 0.5rem; align-items: center; }
-.header button { background: var(--btn-bg); color: var(--text); border: 1px solid var(--border); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
-.header button:hover { background: var(--btn-hover); }
+.header-actions { display: flex; align-items: center; gap: 0.5rem; }
+.header-actions button, .btn-group button { background: var(--btn-bg); color: var(--text); border: 1px solid var(--border); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.85rem; }
+.header-actions button:hover, .btn-group button:hover { background: var(--btn-hover); }
+.btn-group { display: flex; }
+.btn-group button:first-child { border-radius: 6px 0 0 6px; }
+.btn-group button:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
 .container { max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
 .section { background: var(--bg-card); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 1.5rem; }
 .section-header { padding: 1rem 1.25rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
 .section-header h2 { font-size: 1rem; }
+.section-header button { background: transparent; color: var(--text-muted); border: 1px solid transparent; border-radius: 50%; width: 2rem; height: 2rem; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 0.85rem; line-height: 1; }
+.section-header button:hover { background: var(--btn-bg); color: var(--text); border-color: var(--border); }
 .section-header .count { font-size: 0.85rem; color: var(--text-muted); font-weight: normal; }
 table { width: 100%; border-collapse: collapse; }
 th, td { padding: 0.75rem 1.25rem; text-align: left; border-bottom: 1px solid var(--border-light); font-size: 0.9rem; }
 th { color: var(--text-muted); font-weight: 500; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
 .mono { font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.85rem; }
 .muted { color: var(--text-muted); font-size: 0.82rem; }
-.actions { white-space: nowrap; }
-.actions button { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 0.85rem; padding: 0.2rem 0.5rem; }
-.actions button:hover { text-decoration: underline; }
-.actions button.danger { color: var(--red); }
+.actions { white-space: nowrap; padding-left: 0.5rem !important; padding-right: 0.5rem !important; }
+.actions button { background: transparent; border: 1px solid transparent; border-radius: 50%; width: 1.8rem; height: 1.8rem; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; font-size: 0.8rem; line-height: 1; }
+.actions button:hover { background: var(--btn-bg); border-color: var(--border); }
+.actions button.danger:hover { background: rgba(207, 34, 46, 0.1); border-color: var(--red); }
 .btn { padding: 0.5rem 1rem; border: none; border-radius: 6px; font-size: 0.9rem; cursor: pointer; font-weight: 500; }
 .btn-primary { background: var(--green-bg); color: #fff; }
 .btn-primary:hover { background: var(--green-bg-hover); }
@@ -272,19 +277,22 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
   <div class="header">
     <h1><a href="https://github.com/gowee/keywa" target="_blank" rel="noopener">🔐 keywa</a> <span class="timeout-badge" title="Approval timeout. Set TIMEOUT_SECONDS env var to change.">⏱ ${timeoutLabel}</span></h1>
     <div class="header-actions">
-      <button onclick="registerWebhook()" title="Register Telegram webhook">📡 Webhook</button>
       <button id="theme-btn" onclick="toggleTheme()" title="Toggle theme">🌙</button>
-      <button onclick="logout()">Logout</button>
+      <div class="btn-group">
+        <button onclick="registerWebhook()" title="Register Telegram webhook">📡 Webhook</button>
+        <button onclick="logout()">Logout</button>
+      </div>
     </div>
   </div>
   <div class="container">
     <div class="section">
       <div class="section-header">
         <h2>Secrets <span id="secret-count" class="count"></span></h2>
+        <button onclick="loadSecrets()" title="Refresh">🔄</button>
       </div>
       <div style="overflow-x:auto">
       <table>
-        <thead><tr><th title="Unique secret identifier">ID</th><th title="Per-secret access token (masked)">Token</th><th title="Allowed IPs or CIDRs (empty = any)">IPs</th><th title="Last modified">Updated</th><th>Actions</th></tr></thead>
+        <thead><tr><th title="Unique secret identifier">ID</th><th title="Per-secret access token (masked)">Token</th><th title="Allowed IPs or CIDRs">CIDRs</th><th title="Last modified">Updated</th><th>Actions</th></tr></thead>
         <tbody id="secret-list"><tr><td colspan="5" class="empty">Loading...</td></tr></tbody>
       </table>
       </div>
@@ -297,23 +305,23 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
             <input id="f-id" placeholder="e.g. tyo2-luks" maxlength="${LIMITS.secretId}">
             <div class="char-count"><span id="f-id-count">0</span>/${LIMITS.secretId}</div>
           </label>
-          <label>Token
+          <label title="Per-secret access token; empty = clear">Token
             <div class="input-with-btn">
-              <input id="f-token" placeholder="empty = no token auth" title="per-secret access token; empty = clear" maxlength="${LIMITS.token}">
+              <input id="f-token" placeholder="empty = no token auth" maxlength="${LIMITS.token}">
               <button class="btn btn-secondary btn-inline" onclick="generateToken()" title="Generate random token">🎲</button>
             </div>
             <div class="char-count"><span id="f-token-count">0</span>/${LIMITS.token}</div>
           </label>
         </div>
         <div class="form-row" style="margin-bottom: 0.4rem">
-          <label>IPs
-            <input id="f-cidrs" placeholder="e.g. 192.168.1.0/24, 10.0.0.1" title="comma-separated IPs or CIDRs; empty = no IP restriction" maxlength="${LIMITS.cidrs}">
+          <label title="Comma-separated IPs or CIDRs; empty = no IP restriction">Allowed IPs or CIDRs
+            <input id="f-cidrs" placeholder="empty = any" maxlength="${LIMITS.cidrs}">
             <div class="char-count"><span id="f-cidrs-count">0</span>/${LIMITS.cidrs}</div>
           </label>
         </div>
         <div class="form-row">
-          <label>Value
-            <textarea id="f-value" rows="3" placeholder="leave empty to keep existing" title="the secret value to store" maxlength="${LIMITS.value}"></textarea>
+          <label title="The secret value to store; leave empty to keep existing">Value
+            <textarea id="f-value" rows="3" placeholder="leave empty to keep existing" maxlength="${LIMITS.value}"></textarea>
             <div class="char-count"><span id="f-value-count">0</span>/${LIMITS.value}</div>
           </label>
         </div>
@@ -393,8 +401,8 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
           '<td class="mono muted" title="' + escAttr(cidrs) + '">' + esc(cidrsDisplay) + '</td>' +
           '<td class="muted">' + esc(updated) + '</td>' +
           '<td class="actions">' +
-            '<button onclick="editSecret(this.dataset.id)" data-id="' + escAttr(s.id) + '">Edit</button> ' +
-            '<button class="danger" onclick="deleteSecret(this.dataset.id)" data-id="' + escAttr(s.id) + '">Delete</button>' +
+            '<button onclick="editSecret(this.dataset.id)" data-id="' + escAttr(s.id) + '" title="Edit">✏️</button>' +
+            '<button class="danger" onclick="deleteSecret(this.dataset.id)" data-id="' + escAttr(s.id) + '" title="Delete">🗑️</button>' +
           '</td>' +
         '</tr>';
       }).join('');

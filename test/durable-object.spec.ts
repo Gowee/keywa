@@ -10,7 +10,7 @@ describe("KeySessionDO", () => {
 
   it("init creates a new pending approval", async () => {
     const stub = getStub("s1", "r1");
-    const approval = await stub.init("s1", "r1", "127.0.0.1");
+    const approval = await stub.init("s1", "r1", "127.0.0.1", "my-secret");
 
     expect(approval.status).toBe("pending");
     expect(approval.secretId).toBe("s1");
@@ -18,6 +18,7 @@ describe("KeySessionDO", () => {
     expect(approval.ip).toBe("127.0.0.1");
     expect(approval.callbackNonce).toBeTruthy();
     expect(approval.expiresAt).toBeGreaterThan(Date.now());
+    expect(approval.secret).toBe("my-secret");
   });
 
   it("approve resolves a pending approval", async () => {
@@ -29,7 +30,7 @@ describe("KeySessionDO", () => {
     expect(result.approval).toBeTruthy();
     expect(result.approval!.status).toBe("approved");
 
-    // State is kept for disconnected clients — second approve reports already resolved
+    // State persists until retrieved via wait() or init() — second approve reports already resolved
     const result2 = await stub.approve(approval.callbackNonce);
     expect(result2.ok).toBe(false);
     expect(result2.error).toBe("Already approved");
@@ -74,7 +75,7 @@ describe("KeySessionDO", () => {
 
   it("wait resolves when approved", async () => {
     const stub = getStub("s6", "r1");
-    const approval = await stub.init("s6", "r1", "127.0.0.1");
+    const approval = await stub.init("s6", "r1", "127.0.0.1", "super-secret");
 
     // Start waiting (in background)
     const waitPromise = stub.wait();
@@ -84,6 +85,7 @@ describe("KeySessionDO", () => {
 
     const result = await waitPromise;
     expect(result.status).toBe("approved");
+    expect(result.secret).toBe("super-secret");
   });
 
   it("wait resolves when denied", async () => {
@@ -97,17 +99,37 @@ describe("KeySessionDO", () => {
     expect(result.status).toBe("denied");
   });
 
+  it("wait cleans up DO after resolving", async () => {
+    const stub = getStub("s6b", "r1");
+    const approval = await stub.init("s6b", "r1", "127.0.0.1");
+
+    const waitPromise = stub.wait();
+    await stub.approve(approval.callbackNonce);
+    const result = await waitPromise;
+    expect(result.status).toBe("approved");
+
+    // DO was cleaned up — next init creates a fresh request
+    const fresh = await stub.init("s6b", "r1", "127.0.0.1");
+    expect(fresh.status).toBe("pending");
+  }, 15000);
+
   it("init returns resolved state after approval (disconnected client)", async () => {
     const stub = getStub("s8", "r1");
-    const approval = await stub.init("s8", "r1", "127.0.0.1");
+    const approval = await stub.init("s8", "r1", "127.0.0.1", "reconnect-secret");
 
     // Approve the request
     await stub.approve(approval.callbackNonce);
 
-    // New init on the same DO should return the approved result
+    // New init on the same DO should return the approved result with secret
     const recovered = await stub.init("s8", "r1", "127.0.0.1");
     expect(recovered.status).toBe("approved");
     expect(recovered.secretId).toBe("s8");
+    expect(recovered.secret).toBe("reconnect-secret");
+
+    // DO was cleaned up after retrieval — next init creates a fresh request
+    const fresh = await stub.init("s8", "r1", "127.0.0.1");
+    expect(fresh.status).toBe("pending");
+    expect(fresh.secretId).toBe("s8");
   });
 
   it("init cleans up abandoned pending and creates fresh request", async () => {
