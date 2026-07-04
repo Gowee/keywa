@@ -16,7 +16,7 @@ curl GET /secret/mysecret?token=credential → blocks → Telegram notification 
 3. keywa sends a Telegram notification with inline Approve/Deny buttons
 4. `curl` blocks (HTTP long-polling) until the admin acts
 5. Admin clicks Approve → secret is returned to `curl`
-6. Or: admin clicks Deny → `curl` gets 403, or timeout (default 1 hour) → 410
+6. Or: admin clicks Deny → `curl` gets 403, or timeout (default 1 hour) → 504
 
 See [docs/architecture.md](docs/architecture.md) for design decisions and why Durable Objects over KV polling.
 

@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { waitUntil } from "cloudflare:workers";
 import type { Env, SecretRow } from "./types";
 import { DEFAULT_SESSION, getTimeoutMs } from "./types";
 import {
@@ -63,6 +64,8 @@ async function handleSecretRequest(
   const clientIp = parseClientIp(rawIp) ?? rawIp;
 
   if (!secretId) return c.text("secretId required", 400);
+  if (secretId === LOGIN_SECRET_ID)
+    return c.text("secretId is reserved", 400);
   if (secretId.length > LIMITS.secretId)
     return c.text(`secretId too long (max ${LIMITS.secretId})`, 400);
   if (session.length > LIMITS.session)
@@ -123,23 +126,27 @@ async function handleSecretRequest(
     throw err;
   }
 
-  // If the client disconnects, cancel the pending wait so the resolver
-  // doesn't become stale. This allows a retrying client to get a fresh
-  // request instead of hitting "already pending".
-  const onAbort = () => { stub.cancelWait(); };
+  // Cancel the pending wait if the client disconnects so the DO's
+  // resolver doesn't become stale. waitUntil() is required because the
+  // abort handler fires as the Worker is being torn down — without it
+  // the cancelWait() RPC would be dropped and subsequent requests to
+  // the same session would keep hitting 409 until the alarm cleans up.
+  const onAbort = () => { waitUntil(stub.cancelWait()); };
   c.req.raw.signal.addEventListener("abort", onAbort);
 
   const approval = await stub.wait();
 
   switch (approval.status) {
     case "approved": {
-      if (!approval.secret) return c.text("Secret deleted", 410);
+      // Secret is captured at init time and stored in the DO. If missing,
+      // the DO state is corrupted — treat as a server error.
+      if (!approval.secret) return c.text("Secret unavailable", 500);
       return c.text(approval.secret);
     }
     case "denied":
       return c.text("Denied", 403);
     case "expired":
-      return c.text("Request expired", 410);
+      return c.text("Request expired", 504);
     default:
       return c.text("Unknown status", 500);
   }
@@ -332,7 +339,8 @@ app.post("/admin/auth/login", async (c) => {
 
     await stub.init(secretId, session, ip);
 
-    const onAbort = () => { stub.cancelWait(); };
+    // Cancel pending wait on disconnect — see /secret/:secretId handler.
+    const onAbort = () => { waitUntil(stub.cancelWait()); };
     c.req.raw.signal.addEventListener("abort", onAbort);
 
     const approval = await stub.wait();

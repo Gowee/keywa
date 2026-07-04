@@ -73,6 +73,8 @@ Worker                          Durable Object
   │   returns secret to curl       │
 ```
 
+**Client disconnect**: If the HTTP connection drops, the Worker's abort signal fires and calls `cancelWait()` via `waitUntil()` to clear the DO's in-memory resolver. `waitUntil()` is required because the Worker is being torn down — without it the RPC would be dropped and the resolver would stay stale until the alarm fires. Once the resolver is cleared, a retrying client (same or different IP) sees no active listener and can take over the session.
+
 ## Naming & Identifiers
 
 All identifiers use base64url encoding (no padding) for compactness. Hash and nonce are 128-bit.
@@ -134,13 +136,20 @@ The DO stores a single KV key `"state"` containing:
 |-------|--------|
 | `init()` | Store state, set alarm, notify Telegram (captures chatId/messageId) |
 | `wait()` | Hold Promise in memory (zero CPU); on resolve → delete state, cancel alarm |
+| `cancelWait()` | Clear in-memory resolver (called by Worker on client disconnect via abort signal + `waitUntil`) |
 | `approve(nonce)` | Validate nonce → set status → resolve wait() |
 | `deny(nonce)` | Validate nonce → set status → resolve wait() |
 | `alarm()` | Update Telegram message (⏰ Expired) → resolve wait() → delete state |
 
-**State cleanup**: State is deleted when the result is retrieved (via `wait()` resolving or `init()` returning a resolved result). If the client never retrieves the result, the alarm cleans up on expiration. No state persists forever.
+**State cleanup**: State is deleted when the result is retrieved (via `wait()` resolving or `init()` returning a resolved result). If the client never retrieves the result, the alarm cleans up on expiration. The alarm is always set (on init and on Case 3 reuse) — no state persists forever.
 
-**Re-request**: If `init()` is called for a pending (secretId, session), the timeout is refreshed (`setAlarm` replaces the existing alarm) and the Telegram notification is re-sent if expired.
+**Duplicate-request policy**: When `init()` is called for an existing (secretId, session):
+
+| State | Listener | Behavior |
+|-------|----------|----------|
+| Resolved (approved/denied/expired) | — | Return result immediately, clean up (Case 1) |
+| Pending | Active (`waitResolver !== null`) | Reject with 409 (Case 2) |
+| Pending | None (client disconnected) | Preserve state, refresh expiry. If IP changed: revoke nonce, refresh Telegram message (Case 3) |
 
 **Secret stored in DO**: The worker passes the secret value to `init()`, which stores it in the DO state. This ensures the approved value is the one at request time, even if the D1 value changes later, and avoids a second D1 read after approval.
 
@@ -233,6 +242,23 @@ Client → GET /secret/:secretId?token=KEY_TOKEN
   → Worker returns secret to client (from DO, no D1 re-read)
 ```
 
+### Client Disconnect & Retry
+
+```
+Client A → GET /secret/:secretId → DO.init() → DO.wait() (blocks)
+  ... Client A disconnects ...
+  → Worker abort signal fires → waitUntil(stub.cancelWait())
+  → DO: waitResolver = null
+
+Client B (same or different IP) → GET /secret/:secretId
+  → DO.init() → no active listener → Case 3
+    → if IP changed: revoke nonce, update IP, refresh Telegram message
+    → if IP same: preserve state, update expiry
+  → DO.wait() (blocks)
+  ... admin clicks Approve ...
+  → Client B receives the secret
+```
+
 ### Approval (Admin via Telegram)
 
 ```
@@ -252,5 +278,5 @@ Alarm fires → DO.alarm()
   → Updates Telegram message to show "⏰ Expired" (best-effort)
   → Resolves wait() with status "expired"
   → Deletes state from DO KV (self-cleanup)
-  → Worker returns "Timeout" (408) to client
+  → Worker returns "Request expired" (504) to client
 ```

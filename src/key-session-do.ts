@@ -27,10 +27,8 @@ import { randomNonce } from "./crypto";
  *     is rejected with "Request already pending" to prevent multiple clients
  *     from silently receiving the same secret on one approval.
  *   - The Worker calls cancelWait() when the client's HTTP connection drops
- *     (abort signal), so a retrying client sees no active listener and gets
- *     a fresh request instead of 409.
- *   - If the previous client disconnected without cancelWait() (e.g. Worker
- *     crash), the alarm eventually cleans up the stale state.
+ *     (abort signal + waitUntil), so a retrying client sees no active listener
+ *     and gets a fresh request instead of 409.
  *   - Pending requests with no listener are preserved (not recreated).
  *     If IP changed, the nonce is revoked and the Telegram message is
  *     refreshed in-place. Same-IP retries silently reattach.
@@ -41,7 +39,8 @@ import { randomNonce } from "./crypto";
  * State cleanup:
  *   - On result retrieval: wait() or init() deletes state and cancels alarm.
  *   - On expiration: alarm() deletes state (pending → expired; resolved → removed).
- *   - No state persists forever.
+ *   - The alarm is always set (on init and on Case 3 reuse) and acts as the
+ *     safety net — no state persists forever.
  */
 
 interface State {
