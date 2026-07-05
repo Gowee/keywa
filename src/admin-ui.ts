@@ -276,7 +276,7 @@ export function dashboardPage(timeoutSeconds: number = 900): string {
 </head>
 <body>
   <div class="header">
-    <h1><a href="https://github.com/gowee/keywa" target="_blank" rel="noopener">🔐 keywa</a> <span class="timeout-badge" title="Approval timeout. Set TIMEOUT_SECONDS env var to change.">⏱ ${timeoutLabel}</span></h1>
+    <h1><a href="https://github.com/gowee/keywa" target="_blank" rel="noopener">🔐 keywa</a> <span class="timeout-badge" title="Max approval timeout. Override per-request with ?timeout=N. Set MAX_TIMEOUT_SECONDS env var to change.">⏱ ${timeoutLabel}</span></h1>
     <div class="header-actions">
       <button id="theme-btn" onclick="toggleTheme()" title="Toggle theme">🌙</button>
       <div class="btn-group">

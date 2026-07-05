@@ -1,7 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Approval } from "./types";
-import { getTimeoutMs } from "./types";
-import { sendApprovalMessage, updateApprovalMessage, refreshApprovalMessage } from "./telegram";
+import { getMaxTimeoutMs } from "./types";
+import {
+  sendApprovalMessage,
+  updateApprovalMessage,
+  refreshApprovalMessage,
+} from "./telegram";
 import { randomNonce } from "./crypto";
 
 /**
@@ -63,10 +67,16 @@ interface State {
 const STATE_KEY = "state";
 
 export class KeySessionDO extends DurableObject<Env> {
-  private waitResolver: ((value: Approval) => void | Promise<void>) | null = null;
+  private waitResolver: ((value: Approval) => void | Promise<void>) | null =
+    null;
 
   /**
    * Initialize or recover a session.
+   *
+   * @param timeoutMs Effective timeout in milliseconds. Worker has already
+   *     clamped any URL `?timeout=` to `[1000, maxMs]` (where `0` resolves
+   *     to `maxMs`). Case 3 reuse recomputes `expiresAt` from this value,
+   *     so each reconnect may set a fresh deadline.
    *
    * Three cases when a previous state exists:
    *  1. Already resolved (approved/denied) → return result immediately.
@@ -74,10 +84,18 @@ export class KeySessionDO extends DurableObject<Env> {
    *  2. Pending with an active listener → reject (409).
    *     Prevents multiple clients from silently receiving the same secret.
    *  3. Pending with no listener (client disconnected) → preserve state,
-   *     update expiry. If IP changed: revoke nonce, update IP, refresh
-   *     Telegram message in-place.
+   *     update expiry from `timeoutMs`. If IP changed: revoke nonce,
+   *     update IP, refresh Telegram message in-place.
    */
-  async init(secretId: string, session: string, ip: string, secret?: string): Promise<Approval> {
+  async init(
+    secretId: string,
+    session: string,
+    ip: string,
+    secret?: string,
+    timeoutMs?: number,
+  ): Promise<Approval> {
+    const effectiveTimeoutMs = timeoutMs ?? getMaxTimeoutMs(this.env);
+
     const existing = this.loadState();
 
     if (existing) {
@@ -99,11 +117,10 @@ export class KeySessionDO extends DurableObject<Env> {
       }
 
       // Case 3: Pending but no listener (client disconnected).
-      // Preserve the existing request; update expiry and optionally
-      // revoke the nonce if the IP changed.
-      const timeoutMs = getTimeoutMs(this.env);
+      // Preserve the existing request; update expiry (from current URL
+      // param) and optionally revoke the nonce if the IP changed.
       const now = Date.now();
-      const expiresAt = now + timeoutMs;
+      const expiresAt = now + effectiveTimeoutMs;
 
       if (existing.ip !== ip) {
         // IP changed — revoke nonce, update IP, refresh Telegram message.
@@ -153,10 +170,9 @@ export class KeySessionDO extends DurableObject<Env> {
     }
 
     // New request (or fresh request after cleaning up an abandoned one)
-    const timeoutMs = getTimeoutMs(this.env);
     const callbackNonce = randomNonce();
     const now = Date.now();
-    const expiresAt = now + timeoutMs;
+    const expiresAt = now + effectiveTimeoutMs;
     const state: State = {
       secretId,
       session,

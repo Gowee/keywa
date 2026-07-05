@@ -134,7 +134,7 @@ The DO stores a single KV key `"state"` containing:
 
 | Phase | Action |
 |-------|--------|
-| `init()` | Store state, set alarm, notify Telegram (captures chatId/messageId) |
+| `init(secretId, session, ip, secret?, timeoutMs?)` | Store state, set alarm at `now + timeoutMs` (default = `MAX_TIMEOUT_SECONDS`), notify Telegram (captures chatId/messageId). `timeoutMs` is URL-supplied (`?timeout=`, clamped to `[1s, MAX_TIMEOUT_SECONDS]`; `0` = max). |
 | `wait()` | Hold Promise in memory (zero CPU); on resolve → delete state, cancel alarm |
 | `cancelWait()` | Clear in-memory resolver (called by Worker on client disconnect via abort signal + `waitUntil`) |
 | `approve(nonce)` | Validate nonce → set status → resolve wait() |
@@ -149,7 +149,7 @@ The DO stores a single KV key `"state"` containing:
 |-------|----------|----------|
 | Resolved (approved/denied/expired) | — | Return result immediately, clean up (Case 1) |
 | Pending | Active (`waitResolver !== null`) | Reject with 409 (Case 2) |
-| Pending | None (client disconnected) | Preserve state, refresh expiry. If IP changed: revoke nonce, refresh Telegram message (Case 3) |
+| Pending | None (client disconnected) | Preserve state, recompute `expiresAt` from the URL `?timeout=` of the reconnecting request (clamped to `[1s, MAX_TIMEOUT_SECONDS]`; `0` or absent = max). If IP changed: revoke nonce, refresh Telegram message (Case 3) |
 
 **Secret stored in DO**: The worker passes the secret value to `init()`, which stores it in the DO state. This ensures the approved value is the one at request time, even if the D1 value changes later, and avoids a second D1 read after approval.
 
@@ -250,10 +250,10 @@ Client A → GET /secret/:secretId → DO.init() → DO.wait() (blocks)
   → Worker abort signal fires → waitUntil(stub.cancelWait())
   → DO: waitResolver = null
 
-Client B (same or different IP) → GET /secret/:secretId
+Client B (same or different IP) → GET /secret/:secretId?timeout=...
   → DO.init() → no active listener → Case 3
     → if IP changed: revoke nonce, update IP, refresh Telegram message
-    → if IP same: preserve state, update expiry
+    → if IP same: preserve state, update expiry from URL ?timeout=
   → DO.wait() (blocks)
   ... admin clicks Approve ...
   → Client B receives the secret

@@ -5,7 +5,7 @@ export interface Env {
   TELEGRAM_CHAT_ID: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
   ADMIN_TOKEN: string;
-  TIMEOUT_SECONDS?: string;
+  MAX_TIMEOUT_SECONDS?: string;
   DISABLE_TELEGRAM_LOGIN?: string;
   LOGIN_RATE_LIMIT?: RateLimit;
   KEY_REQUEST_RATE_LIMIT?: RateLimit;
@@ -36,9 +36,9 @@ export interface Approval {
   secret?: string;
 }
 
-/** Get the timeout in milliseconds from env, defaulting to 3600s (1 hour). */
-export function getTimeoutMs(env: { TIMEOUT_SECONDS?: string }): number {
-  const parsed = parseInt(env.TIMEOUT_SECONDS || "", 10);
+/** Get the max timeout in milliseconds from env, defaulting to 3600s (1 hour). */
+export function getMaxTimeoutMs(env: { MAX_TIMEOUT_SECONDS?: string }): number {
+  const parsed = parseInt(env.MAX_TIMEOUT_SECONDS || "", 10);
   return (Number.isFinite(parsed) && parsed > 0 ? parsed : 3600) * 1000;
 }
 

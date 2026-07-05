@@ -60,9 +60,13 @@ In `wrangler.toml`:
 
 ```toml
 [vars]
-TIMEOUT_SECONDS = "3600"               # approval timeout (default 1 hour)
+MAX_TIMEOUT_SECONDS = "3600"           # upper bound (seconds) for ?timeout= (default 1 hour)
 # DISABLE_TELEGRAM_LOGIN = "true"      # uncomment to disable Telegram login
 ```
+
+`MAX_TIMEOUT_SECONDS` caps the approval wait time. Clients may pass `?timeout=N`
+(seconds) per request — clamped to `[1, MAX_TIMEOUT_SECONDS]`. `0` or absent
+means "use the max".
 
 Rate limits are configured via `[[ratelimits]]` bindings (see `wrangler.toml.sample`).
 
@@ -117,6 +121,10 @@ curl "https://keywa.example.org/secret/mysecret?token=per-secret-credential"
 
 # Or via Bearer header
 curl -H "Authorization: Bearer per-secret-credential" "https://keywa.example.org/secret/mysecret"
+
+# Per-request timeout (seconds). Clamped to [1, MAX_TIMEOUT_SECONDS].
+# Omit or use 0 to mean "use the max".
+curl "https://keywa.example.org/secret/mysecret?token=per-secret-credential&timeout=300"
 ```
 
 With a named session (for idempotent re-fetching):
@@ -148,7 +156,7 @@ DEVICE="/dev/vda2"
 echo "Fetching LUKS key..."
 SECRET=$(curl -fsSH "Authorization: Bearer $SECRET_TOKEN" \
   --max-time 3600 --retry 3 \
-  "$KEYSERVER/secret/$SECRET_ID?session=boot")
+  "$KEYSERVER/secret/$SECRET_ID?session=boot&timeout=3600")
 
 if [ -z "$SECRET" ]; then
   echo "Failed to fetch secret"
@@ -166,7 +174,7 @@ exit 0
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| GET | `/secret/:secretId` | `?token=` or `Bearer` | Request secret (long-poll). Optional `?session=` |
+| GET | `/secret/:secretId` | `?token=` or `Bearer` | Request secret (long-poll). Optional `?session=`, `?timeout=N` (seconds, clamped to `[1, MAX_TIMEOUT_SECONDS]`, `0` or absent = max) |
 | GET | `/` | — | Health check |
 
 ### Web Admin

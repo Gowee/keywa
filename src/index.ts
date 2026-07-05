@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { waitUntil } from "cloudflare:workers";
 import type { Env, SecretRow } from "./types";
-import { DEFAULT_SESSION, getTimeoutMs } from "./types";
+import { DEFAULT_SESSION, getMaxTimeoutMs } from "./types";
 import {
   parseCallbackData,
   answerCallbackQuery,
@@ -63,9 +63,30 @@ async function handleSecretRequest(
     "unknown";
   const clientIp = parseClientIp(rawIp) ?? rawIp;
 
+  // Per-request timeout: clamped to [1s, MAX_TIMEOUT_SECONDS].
+  // `0` (or absent / empty) means default = MAX_TIMEOUT_SECONDS.
+  const maxTimeoutMs = getMaxTimeoutMs(c.env);
+  const timeoutRaw = c.req.query("timeout");
+  let effectiveTimeoutMs = maxTimeoutMs;
+  if (timeoutRaw !== undefined && timeoutRaw !== "") {
+    if (timeoutRaw.includes("\0"))
+      return c.text("timeout must not contain null byte", 400);
+    const parsed = parseInt(timeoutRaw, 10);
+    if (!Number.isFinite(parsed))
+      return c.text(
+        "timeout must be a non-negative integer (seconds, 0=default)",
+        400,
+      );
+    if (parsed === 0) {
+      effectiveTimeoutMs = maxTimeoutMs;
+    } else {
+      const clamped = Math.min(maxTimeoutMs, Math.max(1000, parsed * 1000));
+      effectiveTimeoutMs = clamped;
+    }
+  }
+
   if (!secretId) return c.text("secretId required", 400);
-  if (secretId === LOGIN_SECRET_ID)
-    return c.text("secretId is reserved", 400);
+  if (secretId === LOGIN_SECRET_ID) return c.text("secretId is reserved", 400);
   if (secretId.length > LIMITS.secretId)
     return c.text(`secretId too long (max ${LIMITS.secretId})`, 400);
   if (session.length > LIMITS.session)
@@ -118,7 +139,13 @@ async function handleSecretRequest(
   ) as DurableObjectStub<KeySessionDO>;
 
   try {
-    await stub.init(secretId, session, clientIp, row.secret);
+    await stub.init(
+      secretId,
+      session,
+      clientIp,
+      row.secret,
+      effectiveTimeoutMs,
+    );
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     if (msg.includes("already pending"))
@@ -131,7 +158,9 @@ async function handleSecretRequest(
   // abort handler fires as the Worker is being torn down — without it
   // the cancelWait() RPC would be dropped and subsequent requests to
   // the same session would keep hitting 409 until the alarm cleans up.
-  const onAbort = () => { waitUntil(stub.cancelWait()); };
+  const onAbort = () => {
+    waitUntil(stub.cancelWait());
+  };
   c.req.raw.signal.addEventListener("abort", onAbort);
 
   const approval = await stub.wait();
@@ -254,7 +283,7 @@ app.post("/telegram/webhook", async (c) => {
 app.get("/admin/status", (c) => {
   const telegram = !!(c.env.TELEGRAM_BOT_TOKEN && c.env.TELEGRAM_CHAT_ID);
   const telegramDisabled = c.env.DISABLE_TELEGRAM_LOGIN === "true";
-  const timeoutSeconds = getTimeoutMs(c.env) / 1000;
+  const timeoutSeconds = getMaxTimeoutMs(c.env) / 1000;
   // Rate limit status is reported by the login endpoint on failure;
   // we don't call limit() here to avoid consuming a slot.
   return c.json({ telegram, telegramDisabled, timeoutSeconds });
@@ -294,7 +323,7 @@ app.get("/admin", async (c) => {
 app.get("/admin/dashboard", async (c) => {
   const userId = await verifySession(c.req.raw, c.env.ADMIN_TOKEN);
   if (!userId) return c.redirect("/admin");
-  const timeoutSeconds = getTimeoutMs(c.env) / 1000;
+  const timeoutSeconds = getMaxTimeoutMs(c.env) / 1000;
   return c.html(dashboardPage(timeoutSeconds));
 });
 
@@ -340,7 +369,9 @@ app.post("/admin/auth/login", async (c) => {
     await stub.init(secretId, session, ip);
 
     // Cancel pending wait on disconnect — see /secret/:secretId handler.
-    const onAbort = () => { waitUntil(stub.cancelWait()); };
+    const onAbort = () => {
+      waitUntil(stub.cancelWait());
+    };
     c.req.raw.signal.addEventListener("abort", onAbort);
 
     const approval = await stub.wait();
@@ -393,15 +424,20 @@ app.get("/admin/api/secrets", async (c) => {
   return c.json(results ?? []);
 });
 
-const LIMITS = { secretId: 128, session: 128, token: 128, cidrs: 512, value: 65536 };
+const LIMITS = {
+  secretId: 128,
+  session: 128,
+  token: 128,
+  cidrs: 512,
+  value: 65536,
+};
 
 app.put("/admin/api/secrets/:secretId", async (c) => {
   if (!(await isAdmin(c))) return c.text("Unauthorized", 401);
 
   const secretId = c.req.param("secretId");
   if (!secretId) return c.text("secretId required", 400);
-  if (secretId === LOGIN_SECRET_ID)
-    return c.text("secretId is reserved", 400);
+  if (secretId === LOGIN_SECRET_ID) return c.text("secretId is reserved", 400);
   if (secretId.length > LIMITS.secretId)
     return c.text(`secretId too long (max ${LIMITS.secretId})`, 400);
 

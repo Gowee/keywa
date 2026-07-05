@@ -5,7 +5,7 @@ compatibility_date = "2026-07-01"
 compatibility_flags = ["enable_request_signal"]
 
 [vars]
-TIMEOUT_SECONDS = "3600"  # 1 hour, configurable
+MAX_TIMEOUT_SECONDS = "3600"  # upper bound (seconds) for ?timeout=; clients may pass ?timeout=N (clamped to [1, MAX_TIMEOUT_SECONDS])
 # DISABLE_TELEGRAM_LOGIN = "true"  # uncomment to disable Telegram login
 
 [[d1_databases]]
