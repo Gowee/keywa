@@ -43,7 +43,8 @@ export function ipMatchesCidrs(clientIp: string, cidrs: CidrEntry[]): boolean {
   if (!cidrs.length) return true; // empty allowlist = skip check
   if (!ipaddr.isValid(clientIp)) return false;
   const addr = ipaddr.process(clientIp);
-  return cidrs.some((entry) => addr.match(entry));
+  const kind = addr.kind();
+  return cidrs.some((entry) => entry[0].kind() === kind && addr.match(entry));
 }
 
 /** Strip /32 (IPv4) and /128 (IPv6) suffixes for cleaner storage. */

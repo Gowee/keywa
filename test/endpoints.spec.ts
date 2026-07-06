@@ -246,6 +246,21 @@ describe("Secret retrieval — CIDR", () => {
     expect(await resp.text()).toContain("IP not allowed");
   });
 
+  it("rejects IPv6 client against IPv4-only CIDR (family mismatch)", async () => {
+    // Regression: ipaddr.match() throws on family mismatch — must filter to
+    // same family first, not let the throw escape as 500.
+    await insertSecret("cidr-test", "s3cret", "tok123", "10.0.0.0/8");
+    const req = new IncomingRequest(
+      "http://localhost/secret/cidr-test?token=tok123",
+      { headers: { "CF-Connecting-IP": "2001:db8::1" } },
+    );
+    const ctx = createExecutionContext();
+    const resp = await worker.fetch(req, env, ctx);
+    await waitOnExecutionContext(ctx);
+    expect(resp.status).toBe(403);
+    expect(await resp.text()).toContain("IP not allowed");
+  });
+
   it("skips CIDR check when cidrs is empty", async () => {
     // Verify that empty cidrs doesn't cause a 403 — the request proceeds
     // past CIDR check to the DO (which long-polls). We test the fast-reject
