@@ -176,7 +176,9 @@ export async function refreshApprovalMessage(
 
   if (!resp.ok) {
     const body = await resp.text();
-    throw new Error(`Telegram editMessageText (refresh) failed: ${resp.status} ${body}`);
+    throw new Error(
+      `Telegram editMessageText (refresh) failed: ${resp.status} ${body}`,
+    );
   }
 }
 
