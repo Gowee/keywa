@@ -29,6 +29,11 @@ const app = new Hono<{ Bindings: Env }>();
 /** Reserved secretId used for web admin login approval. */
 const LOGIN_SECRET_ID = "__login__";
 
+/** Admin login approval deadline. Tighter than MAX_TIMEOUT_SECONDS since the
+ * admin is at a browser waiting for a Telegram push — 15 min covers normal
+ * response time without leaving stale pending requests for a day. */
+const ADMIN_LOGIN_TIMEOUT_MS = 15 * 60 * 1000;
+
 /** Reject secretId or session containing null byte (delimiter for DO name hashing). */
 function rejectNullByte(value: string, label: string): string | null {
   if (value.includes("\0")) return `${label} must not contain null byte`;
@@ -366,7 +371,7 @@ app.post("/admin/auth/login", async (c) => {
       doId,
     ) as DurableObjectStub<KeySessionDO>;
 
-    await stub.init(secretId, session, ip);
+    await stub.init(secretId, session, ip, undefined, ADMIN_LOGIN_TIMEOUT_MS);
 
     // Cancel pending wait on disconnect — see /secret/:secretId handler.
     const onAbort = () => {
